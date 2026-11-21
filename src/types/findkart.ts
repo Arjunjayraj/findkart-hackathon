@@ -57,7 +57,7 @@ export type OnlinePaymentMethod = 'upi' | 'card' | 'netbanking' | 'wallet';
 export type PaymentMethodType = 'cod' | 'upi_on_delivery' | OnlinePaymentMethod;
 
 export interface OrderPaymentInfo {
-  gateway: 'FindKart Sandbox' | 'Razorpay' | 'Stripe' | 'Pay on Delivery';
+  gateway: 'FindKart Sandbox' | 'Razorpay' | 'Pay on Delivery';
   transactionId: string;
   paymentStatus: 'Paid' | 'Pay on Delivery';
   methodLabel: string;
@@ -101,11 +101,10 @@ export interface Order {
 }
 
 export interface PaymentGatewayConfig {
-  mode: 'live-razorpay' | 'live-stripe' | 'sandbox';
+  mode: 'live-razorpay' | 'sandbox';
   razorpayKeyId?: string;
   providers: {
     razorpay: boolean;
-    stripe: boolean;
     sandbox: boolean;
   };
   supportedMethods: PaymentMethodType[];
@@ -114,14 +113,13 @@ export interface PaymentGatewayConfig {
 export interface PaymentSessionResponse {
   sessionId: string;
   signature: string;
-  provider: 'razorpay' | 'stripe' | 'sandbox';
+  provider: 'razorpay' | 'sandbox';
   amount: number;
   amountPaise: number;
   currency: 'INR';
   expiresAt: string;
   razorpayOrderId?: string;
   razorpayKeyId?: string;
-  stripeClientSecret?: string;
 }
 
 export interface SavedAddress {

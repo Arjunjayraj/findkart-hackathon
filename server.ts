@@ -14,7 +14,7 @@ import {
   publishStockNotification,
   publishChatEvent,
 } from './src/kafka/publishers.ts';
-import { getProducer, disconnectProducer } from './src/kafka/kafka.ts';
+import { warmupKafkaProducer, disconnectProducer } from './src/kafka/kafka.ts';
 import type {
   AccountSettings,
   CartItem,
@@ -88,7 +88,7 @@ const PAYMENT_SESSION_TTL_MS = 15 * 60 * 1000;
 
 interface PendingPaymentSession {
   sessionId: string;
-  provider: 'razorpay' | 'stripe' | 'sandbox';
+  provider: 'razorpay' | 'sandbox';
   userId?: string;
   items: CartItem[];
   orderItems: OrderItem[];
@@ -100,7 +100,6 @@ interface PendingPaymentSession {
   amountPaise: number;
   paymentMethod: OnlinePaymentMethod;
   razorpayOrderId?: string;
-  stripePaymentIntentId?: string;
   expiresAt: number;
   consumed: boolean;
 }
@@ -508,16 +507,16 @@ async function startServer() {
           isPgActive = true;
           console.log(`[Database] PostgreSQL active and connected (${conn.latencyMs}ms).`);
         } else {
-          console.warn(`[Database] PostgreSQL init warning: ${initRes.message}. Running in local JSON fallback mode.`);
+          console.log(`[Database] PostgreSQL init skipped (${initRes.message}). Running in local JSON fallback mode.`);
         }
       } else {
-        console.warn(`[Database] PostgreSQL connection failed: ${conn.error}. Running in local JSON fallback mode.`);
+        console.log('[Database] PostgreSQL unreachable. Running in local JSON fallback mode.');
       }
-    } catch (err: unknown) {
-      console.warn('[Database] PostgreSQL startup error:', err);
+    } catch {
+      console.log('[Database] Running in local JSON fallback mode.');
     }
   } else {
-    console.log('[Database] PostgreSQL not configured (DATABASE_URL unset). Running in local JSON fallback mode.');
+    console.log('[Database] PostgreSQL not configured. Running in local JSON fallback mode.');
   }
 
   app.get('/api/health', (_req: Request, res: Response) => {
@@ -1224,17 +1223,14 @@ async function startServer() {
   app.get('/api/payments/config', (_req: Request, res: Response) => {
     const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
     const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
-    const stripeSecret = (process.env.STRIPE_SECRET_KEY || '').trim();
 
     const razorpayReady = Boolean(razorpayKeyId && razorpaySecret);
-    const stripeReady = Boolean(stripeSecret);
 
     const config: PaymentGatewayConfig = {
-      mode: razorpayReady ? 'live-razorpay' : stripeReady ? 'live-stripe' : 'sandbox',
+      mode: razorpayReady ? 'live-razorpay' : 'sandbox',
       razorpayKeyId: razorpayReady ? razorpayKeyId : undefined,
       providers: {
         razorpay: razorpayReady,
-        stripe: stripeReady,
         sandbox: true,
       },
       supportedMethods: ['upi', 'card', 'netbanking', 'wallet', 'cod', 'upi_on_delivery'],
@@ -1299,12 +1295,9 @@ async function startServer() {
 
     const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
     const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
-    const stripeSecret = (process.env.STRIPE_SECRET_KEY || '').trim();
 
-    let provider: 'razorpay' | 'stripe' | 'sandbox' = 'sandbox';
+    let provider: 'razorpay' | 'sandbox' = 'sandbox';
     let razorpayOrderId: string | undefined;
-    let stripePaymentIntentId: string | undefined;
-    let stripeClientSecret: string | undefined;
 
     if (razorpayKeyId && razorpaySecret) {
       try {
@@ -1335,33 +1328,6 @@ async function startServer() {
       } catch (err) {
         console.warn('[Payments] Razorpay order creation failed, using sandbox fallback:', err);
       }
-    } else if (stripeSecret && paymentMethod === 'card') {
-      try {
-        const params = new URLSearchParams({
-          amount: String(amountPaise),
-          currency: 'inr',
-          'automatic_payment_methods[enabled]': 'true',
-          'metadata[sessionId]': sessionId,
-        });
-        const stRes = await fetch('https://api.stripe.com/v1/payment_intents', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${stripeSecret}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: params.toString(),
-        });
-        if (stRes.ok) {
-          const stData = (await stRes.json()) as { id?: string; client_secret?: string };
-          if (stData.id && stData.client_secret) {
-            provider = 'stripe';
-            stripePaymentIntentId = stData.id;
-            stripeClientSecret = stData.client_secret;
-          }
-        }
-      } catch (err) {
-        console.warn('[Payments] Stripe PaymentIntent creation failed, using sandbox fallback:', err);
-      }
     }
 
     const session: PendingPaymentSession = {
@@ -1381,7 +1347,6 @@ async function startServer() {
       amountPaise,
       paymentMethod,
       razorpayOrderId,
-      stripePaymentIntentId,
       expiresAt,
       consumed: false,
     };
@@ -1398,7 +1363,6 @@ async function startServer() {
       expiresAt: new Date(expiresAt).toISOString(),
       razorpayOrderId,
       razorpayKeyId: provider === 'razorpay' ? razorpayKeyId : undefined,
-      stripeClientSecret,
     });
   });
 
@@ -1480,32 +1444,6 @@ async function startServer() {
         transactionId: rpPaymentId,
         paymentStatus: 'Paid',
         methodLabel: 'Online Payment (Razorpay)',
-        paidAt: new Date().toISOString(),
-      };
-    } else if (session.provider === 'stripe') {
-      const stripeSecret = (process.env.STRIPE_SECRET_KEY || '').trim();
-      const intentId = session.stripePaymentIntentId;
-      if (!stripeSecret || !intentId) {
-        res.status(400).json({ message: 'Stripe payment intent unavailable.' });
-        return;
-      }
-      const stRes = await fetch(`https://api.stripe.com/v1/payment_intents/${encodeURIComponent(intentId)}`, {
-        headers: { Authorization: `Bearer ${stripeSecret}` },
-      });
-      if (!stRes.ok) {
-        res.status(402).json({ message: 'Unable to verify Stripe payment status.' });
-        return;
-      }
-      const stData = (await stRes.json()) as { status?: string; amount?: number };
-      if (stData.status !== 'succeeded' || stData.amount !== session.amountPaise) {
-        res.status(402).json({ message: 'Stripe payment has not succeeded.' });
-        return;
-      }
-      paymentInfo = {
-        gateway: 'Stripe',
-        transactionId: intentId,
-        paymentStatus: 'Paid',
-        methodLabel: 'Card (Stripe)',
         paidAt: new Date().toISOString(),
       };
     } else {
@@ -2273,10 +2211,8 @@ async function startServer() {
     console.log(`FindKart server running on http://0.0.0.0:${PORT}`);
   });
 
-  // ── Kafka: warm up producer (non-blocking — fails gracefully if broker is down) ──
-  getProducer()
-    .then(() => console.log('[Kafka] Producer ready'))
-    .catch((e) => console.warn('[Kafka] Broker unreachable at startup (events will be skipped):', e?.message));
+  // ── Kafka: warm up producer cleanly (no-op when unconfigured or unreachable) ──
+  void warmupKafkaProducer();
 
   // Graceful shutdown
   const shutdown = async () => {

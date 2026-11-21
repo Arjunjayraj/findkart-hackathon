@@ -450,9 +450,7 @@ export function PaymentGatewayModal({
                 <span className="px-2 py-0.5 rounded bg-white/15 font-label text-[10px] uppercase tracking-wider text-light-secondary-container shrink-0">
                   {gatewayConfig?.mode === 'live-razorpay'
                     ? 'Razorpay Live'
-                    : gatewayConfig?.mode === 'live-stripe'
-                      ? 'Stripe Live'
-                      : 'Verified Sandbox'}
+                    : 'Verified Sandbox'}
                 </span>
               </div>
               <p className="font-body text-xs text-light-inverse-primary/85 truncate mt-0.5">

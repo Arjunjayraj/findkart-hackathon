@@ -11,9 +11,31 @@ dotenv.config({ path: path.resolve(__dirname, '.env') });
 
 const { Pool } = pg;
 
-function cleanDatabaseUrl(rawUrl: string): { url: string; useSsl: boolean } {
+function normalizeDatabaseUrl(rawUrl: string): string {
+  return rawUrl.trim().replace(/^["']|["']$/g, '');
+}
+
+export function isValidDatabaseUrl(rawUrl: string): boolean {
+  const cleaned = normalizeDatabaseUrl(rawUrl);
+  if (!cleaned || !/^postgres(ql)?:\/\//i.test(cleaned)) {
+    return false;
+  }
   try {
-    const parsed = new URL(rawUrl);
+    const parsed = new URL(cleaned);
+    const host = (parsed.hostname || '').trim().toLowerCase();
+    if (!host || host === 'base' || host === 'host' || host === 'your_host') {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanDatabaseUrl(rawUrl: string): { url: string; useSsl: boolean } {
+  const cleaned = normalizeDatabaseUrl(rawUrl);
+  try {
+    const parsed = new URL(cleaned);
     const hasSslParam = parsed.searchParams.has('sslmode') || parsed.searchParams.has('ssl');
     const isCloudHost =
       parsed.hostname !== 'localhost' &&
@@ -29,10 +51,10 @@ function cleanDatabaseUrl(rawUrl: string): { url: string; useSsl: boolean } {
       useSsl: hasSslParam || isCloudHost,
     };
   } catch {
-    const isCloud = !rawUrl.includes('localhost') && !rawUrl.includes('127.0.0.1');
+    const isCloud = !cleaned.includes('localhost') && !cleaned.includes('127.0.0.1');
     return {
-      url: rawUrl.replace(/[?&]sslmode=[^&]+/g, '').replace(/[?&]ssl=[^&]+/g, ''),
-      useSsl: isCloud || rawUrl.includes('sslmode'),
+      url: cleaned.replace(/[?&]sslmode=[^&]+/g, '').replace(/[?&]ssl=[^&]+/g, ''),
+      useSsl: isCloud || cleaned.includes('sslmode'),
     };
   }
 }
@@ -40,7 +62,7 @@ function cleanDatabaseUrl(rawUrl: string): { url: string; useSsl: boolean } {
 function buildPoolConfig(): pg.PoolConfig {
   const databaseUrl = process.env.DATABASE_URL?.trim();
 
-  if (databaseUrl) {
+  if (databaseUrl && isValidDatabaseUrl(databaseUrl)) {
     const { url, useSsl } = cleanDatabaseUrl(databaseUrl);
     const disableSsl = process.env.DATABASE_SSL === 'false';
 
@@ -49,18 +71,19 @@ function buildPoolConfig(): pg.PoolConfig {
       ssl: useSsl && !disableSsl ? { rejectUnauthorized: false } : false,
       max: Number(process.env.PG_MAX_POOL) || 10,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 15000,
+      connectionTimeoutMillis: 8000,
     };
   }
 
   // Standard individual PG environment variables fallback
+  const pgHost = (process.env.PGHOST || '').trim();
   const isCloudHost =
-    process.env.PGHOST &&
-    process.env.PGHOST !== 'localhost' &&
-    process.env.PGHOST !== '127.0.0.1';
+    pgHost &&
+    pgHost !== 'localhost' &&
+    pgHost !== '127.0.0.1';
 
   return {
-    host: process.env.PGHOST || 'localhost',
+    host: pgHost || 'localhost',
     port: Number(process.env.PGPORT) || 5432,
     user: process.env.PGUSER || 'postgres',
     password: process.env.PGPASSWORD || 'postgres',
@@ -68,14 +91,21 @@ function buildPoolConfig(): pg.PoolConfig {
     ssl: (isCloudHost || process.env.DATABASE_SSL === 'true') ? { rejectUnauthorized: false } : false,
     max: Number(process.env.PG_MAX_POOL) || 10,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 15000,
+    connectionTimeoutMillis: 8000,
   };
 }
 
 export function isPostgresConfigured(): boolean {
+  const rawUrl = process.env.DATABASE_URL?.trim();
+  if (rawUrl) {
+    return isValidDatabaseUrl(rawUrl);
+  }
+  const pgHost = (process.env.PGHOST || '').trim().toLowerCase();
   return Boolean(
-    process.env.DATABASE_URL ||
-    (process.env.PGHOST && process.env.PGDATABASE && process.env.PGUSER)
+    pgHost &&
+    pgHost !== 'base' &&
+    process.env.PGDATABASE &&
+    process.env.PGUSER
   );
 }
 
@@ -86,7 +116,7 @@ export function getPool(): pg.Pool {
     poolInstance = new Pool(buildPoolConfig());
 
     poolInstance.on('error', (err) => {
-      console.error('[PostgreSQL Pool Error]:', err.message);
+      console.log('[Database] PostgreSQL pool notice:', err.message);
     });
   }
   return poolInstance;
@@ -106,6 +136,12 @@ export async function testConnection(): Promise<{
   serverTime?: string;
   error?: string;
 }> {
+  if (!isPostgresConfigured()) {
+    return {
+      connected: false,
+      error: 'PostgreSQL not configured or URL invalid',
+    };
+  }
   const start = Date.now();
   try {
     const res = await query<{ now: string }>('SELECT NOW() as now');
@@ -122,7 +158,7 @@ export async function testConnection(): Promise<{
         ? err.message
         : (typeof errorObj?.code === 'string'
             ? `Connection error: ${errorObj.code}`
-            : 'Unable to reach PostgreSQL server (connection refused or timeout)');
+            : 'Unable to reach PostgreSQL server');
     return {
       connected: false,
       error: message,
