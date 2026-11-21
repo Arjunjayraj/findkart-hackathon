@@ -116,7 +116,7 @@ export function PaymentGatewayModal({
   const [upiApp, setUpiApp] = useState('Google Pay');
   const [upiId, setUpiId] = useState(user?.paymentPreferences?.upiId || '');
 
-  // Card state (kept only in memory; raw PAN/CVV never persisted or transmitted to sandbox endpoints)
+  // Card state (kept only in memory; raw PAN/CVV never persisted or transmitted)
   const [cardNumber, setCardNumber] = useState('');
   const [cardExpiry, setCardExpiry] = useState('');
   const [cardCvv, setCardCvv] = useState('');
@@ -127,6 +127,7 @@ export function PaymentGatewayModal({
   const [selectedWallet, setSelectedWallet] = useState('Amazon Pay');
 
   const [processing, setProcessing] = useState(false);
+  const [razorpayWidgetOpen, setRazorpayWidgetOpen] = useState(false);
   const [stageLabel, setStageLabel] = useState('Connecting to Payment Gateway...');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -135,6 +136,7 @@ export function PaymentGatewayModal({
     setMethod(initialMethod);
     setErrorMsg(null);
     setProcessing(false);
+    setRazorpayWidgetOpen(false);
     if (!upiId && user?.paymentPreferences?.upiId) {
       setUpiId(user.paymentPreferences.upiId);
     }
@@ -162,15 +164,19 @@ export function PaymentGatewayModal({
   useEffect(() => {
     if (!isOpen) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !processing) {
+      if (e.key === 'Escape' && !processing && !razorpayWidgetOpen) {
         onClose();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isOpen, processing, onClose]);
+  }, [isOpen, processing, razorpayWidgetOpen, onClose]);
 
   if (!isOpen) return null;
+
+  const isRazorpayConfigured = gatewayConfig?.mode === 'live-razorpay' && Boolean(gatewayConfig.razorpayKeyId);
+  const isRazorpayTestMode = Boolean(gatewayConfig?.razorpayKeyId?.startsWith('rzp_test_'));
+  const isSandboxOrTest = !isRazorpayConfigured || isRazorpayTestMode;
 
   const rawCardDigits = cardNumber.replace(/\D/g, '');
   const cardBrand = detectCardBrand(rawCardDigits);
@@ -190,10 +196,22 @@ export function PaymentGatewayModal({
     }
   };
 
+  const fillTestDetails = () => {
+    setErrorMsg(null);
+    if (method === 'upi') {
+      setUpiId('success@razorpay');
+    } else if (method === 'card') {
+      setCardNumber('4111 1111 1111 1111');
+      setCardExpiry('12/29');
+      setCardCvv('123');
+      if (!cardHolder) setCardHolder(shipping.fullName || 'Arjun Mehta');
+    }
+  };
+
   const validateCurrentMethod = (): string | null => {
     if (method === 'upi') {
       if (!/^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(upiId.trim())) {
-        return 'Enter a valid UPI ID (e.g., arjun@okaxis or 9845022189@ybl).';
+        return 'Enter a valid UPI ID (e.g., arjun@okaxis or success@razorpay).';
       }
     } else if (method === 'card') {
       if (!passesLuhn(rawCardDigits)) {
@@ -228,23 +246,7 @@ export function PaymentGatewayModal({
     return null;
   };
 
-  const handlePayNow = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMsg(null);
-
-    // If merchant configured live Razorpay, no local card/UPI form validation is needed when launching Razorpay Modal
-    const isLiveRazorpay = gatewayConfig?.mode === 'live-razorpay' && Boolean(gatewayConfig.razorpayKeyId);
-    if (!isLiveRazorpay) {
-      const validationErr = validateCurrentMethod();
-      if (validationErr) {
-        setErrorMsg(validationErr);
-        return;
-      }
-    }
-
-    setProcessing(true);
-    setStageLabel('Creating verified payment session...');
-
+  const createServerPaymentSession = async () => {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-Requested-With': 'FindKart',
@@ -252,24 +254,44 @@ export function PaymentGatewayModal({
     if (authToken) {
       headers.Authorization = `Bearer ${authToken}`;
     }
+    const shippingPayload: OrderShipping = {
+      ...shipping,
+      paymentMethod: method,
+    };
+
+    const createRes = await fetch('/api/payments/create-session', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        items: cart,
+        shipping: shippingPayload,
+        paymentMethod: method,
+      }),
+    });
+    const parsedCreate = await safeParseApiResponse<PaymentSessionResponse>(createRes);
+    return { headers, shippingPayload, parsedCreate };
+  };
+
+  const handleDirectPay = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+
+    if (isRazorpayConfigured && !isRazorpayTestMode) {
+      await handleLaunchRazorpayPopup();
+      return;
+    }
+
+    const validationErr = validateCurrentMethod();
+    if (validationErr) {
+      setErrorMsg(validationErr);
+      return;
+    }
+
+    setProcessing(true);
+    setStageLabel('Creating verified payment session...');
 
     try {
-      const shippingPayload: OrderShipping = {
-        ...shipping,
-        paymentMethod: method,
-      };
-
-      const createRes = await fetch('/api/payments/create-session', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          items: cart,
-          shipping: shippingPayload,
-          paymentMethod: method,
-        }),
-      });
-
-      const parsedCreate = await safeParseApiResponse<PaymentSessionResponse>(createRes);
+      const { headers, shippingPayload, parsedCreate } = await createServerPaymentSession();
 
       if (parsedCreate.isHtmlFallback) {
         const last4 = rawCardDigits.slice(-4);
@@ -305,77 +327,12 @@ export function PaymentGatewayModal({
       }
 
       const session = parsedCreate.data;
-
-      if (session.provider === 'razorpay' && session.razorpayOrderId && session.razorpayKeyId) {
-        setStageLabel('Launching Razorpay Checkout...');
-        const loaded = await loadRazorpayScript();
-        if (!loaded || !window.Razorpay) {
-          throw new Error('Could not load Razorpay Checkout script. Please check your connection.');
-        }
-
-        await new Promise<void>((resolve, reject) => {
-          const rzp = new window.Razorpay!({
-            key: session.razorpayKeyId,
-            amount: session.amountPaise,
-            currency: session.currency,
-            name: 'FindKart',
-            description: `Order Payment (${itemCount} item${itemCount === 1 ? '' : 's'})`,
-            order_id: session.razorpayOrderId,
-            prefill: {
-              name: shipping.fullName,
-              contact: shipping.phone,
-              email: user?.email || undefined,
-            },
-            theme: { color: '#0E3426' },
-            handler: async (resp: {
-              razorpay_order_id?: string;
-              razorpay_payment_id?: string;
-              razorpay_signature?: string;
-            }) => {
-              try {
-                setStageLabel('Verifying payment signature...');
-                const verifyRes = await fetch('/api/payments/verify-and-place-order', {
-                  method: 'POST',
-                  headers,
-                  body: JSON.stringify({
-                    sessionId: session.sessionId,
-                    signature: session.signature,
-                    paymentMethod: method,
-                    paymentProof: {
-                      razorpayOrderId: resp.razorpay_order_id,
-                      razorpayPaymentId: resp.razorpay_payment_id,
-                      razorpaySignature: resp.razorpay_signature,
-                    },
-                  }),
-                });
-                const parsedVerify = await safeParseApiResponse<{
-                  order: Order;
-                  stockOverrides?: Record<string, number>;
-                }>(verifyRes);
-                if (!parsedVerify.ok || !parsedVerify.data?.order) {
-                  throw new Error(parsedVerify.errorMessage || 'Payment verification failed.');
-                }
-                onPaymentSuccess(parsedVerify.data.order, parsedVerify.data.stockOverrides);
-                resolve();
-              } catch (err) {
-                reject(err);
-              }
-            },
-            modal: {
-              ondismiss: () => reject(new Error('Payment cancelled before completion.')),
-            },
-          });
-          rzp.on('payment.failed', (resp) => {
-            reject(new Error(resp?.error?.description || 'Payment authorization failed.'));
-          });
-          rzp.open();
-        });
-        return;
-      }
-
-      // Built-in FindKart Server-Verified Gateway Flow
-      setStageLabel('Authorizing with issuing bank...');
-      await new Promise((r) => window.setTimeout(r, 650));
+      setStageLabel(
+        session.provider === 'razorpay'
+          ? `Authorizing Razorpay Order ${session.razorpayOrderId || ''}...`
+          : 'Authorizing with issuing bank...'
+      );
+      await new Promise((r) => window.setTimeout(r, 550));
 
       const paymentProof: Record<string, string> =
         method === 'upi'
@@ -407,7 +364,6 @@ export function PaymentGatewayModal({
         throw new Error(parsedVerify.errorMessage || 'Payment verification failed. Please retry.');
       }
 
-      // Clear raw card digits from component memory after completion
       setCardNumber('');
       setCardCvv('');
       onPaymentSuccess(parsedVerify.data.order, parsedVerify.data.stockOverrides);
@@ -418,9 +374,106 @@ export function PaymentGatewayModal({
     }
   };
 
+  const handleLaunchRazorpayPopup = async () => {
+    setErrorMsg(null);
+    setProcessing(true);
+    setStageLabel('Creating Razorpay order...');
+
+    try {
+      const { headers, parsedCreate } = await createServerPaymentSession();
+      if (!parsedCreate.ok || !parsedCreate.data) {
+        throw new Error(parsedCreate.errorMessage || 'Could not initialize Razorpay order.');
+      }
+      const session = parsedCreate.data;
+      if (!session.razorpayOrderId || !session.razorpayKeyId) {
+        throw new Error('Razorpay merchant order could not be created.');
+      }
+
+      setStageLabel('Loading Razorpay Checkout...');
+      const loaded = await loadRazorpayScript();
+      if (!loaded || !window.Razorpay) {
+        throw new Error(
+          'Razorpay Checkout script was blocked by your browser/network. You can authorize directly using the In-App form below.'
+        );
+      }
+
+      setRazorpayWidgetOpen(true);
+      await new Promise<void>((resolve, reject) => {
+        const rzp = new window.Razorpay!({
+          key: session.razorpayKeyId,
+          amount: session.amountPaise,
+          currency: session.currency,
+          name: 'FindKart',
+          description: `Order Payment (${itemCount} item${itemCount === 1 ? '' : 's'})`,
+          order_id: session.razorpayOrderId,
+          prefill: {
+            name: shipping.fullName,
+            contact: shipping.phone,
+            email: user?.email || 'care@findkart.in',
+            method,
+          },
+          theme: { color: '#0E3426' },
+          handler: async (resp: {
+            razorpay_order_id?: string;
+            razorpay_payment_id?: string;
+            razorpay_signature?: string;
+          }) => {
+            try {
+              setRazorpayWidgetOpen(false);
+              setStageLabel('Verifying Razorpay signature...');
+              const verifyRes = await fetch('/api/payments/verify-and-place-order', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  sessionId: session.sessionId,
+                  signature: session.signature,
+                  paymentMethod: method,
+                  paymentProof: {
+                    razorpayOrderId: resp.razorpay_order_id,
+                    razorpayPaymentId: resp.razorpay_payment_id,
+                    razorpaySignature: resp.razorpay_signature,
+                  },
+                }),
+              });
+              const parsedVerify = await safeParseApiResponse<{
+                order: Order;
+                stockOverrides?: Record<string, number>;
+              }>(verifyRes);
+              if (!parsedVerify.ok || !parsedVerify.data?.order) {
+                throw new Error(parsedVerify.errorMessage || 'Razorpay signature verification failed.');
+              }
+              onPaymentSuccess(parsedVerify.data.order, parsedVerify.data.stockOverrides);
+              resolve();
+            } catch (err) {
+              reject(err);
+            }
+          },
+          modal: {
+            ondismiss: () => {
+              setRazorpayWidgetOpen(false);
+              reject(new Error('Razorpay window closed before completion. You can retry or complete payment in-app below.'));
+            },
+          },
+        });
+        rzp.on('payment.failed', (resp) => {
+          setRazorpayWidgetOpen(false);
+          reject(new Error(resp?.error?.description || 'Razorpay payment authorization failed.'));
+        });
+        rzp.open();
+      });
+    } catch (err) {
+      setRazorpayWidgetOpen(false);
+      setErrorMsg(err instanceof Error ? err.message : 'Unable to launch Razorpay Checkout.');
+    } finally {
+      setProcessing(false);
+    }
+  };
+
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-center justify-center p-3 sm:p-4"
+      className={`fixed inset-0 z-[60] flex items-center justify-center p-3 sm:p-4 ${
+        razorpayWidgetOpen ? 'pointer-events-none opacity-0' : ''
+      }`}
       role="dialog"
       aria-modal="true"
       aria-label="FindKart Secure Payment Gateway"
@@ -443,13 +496,15 @@ export function PaymentGatewayModal({
               </span>
             </div>
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="font-display text-lg sm:text-xl font-semibold leading-tight truncate">
                   FindKart Payment Gateway
                 </h2>
                 <span className="px-2 py-0.5 rounded bg-white/15 font-label text-[10px] uppercase tracking-wider text-light-secondary-container shrink-0">
-                  {gatewayConfig?.mode === 'live-razorpay'
-                    ? 'Razorpay Live'
+                  {isRazorpayConfigured
+                    ? isRazorpayTestMode
+                      ? 'Razorpay Test'
+                      : 'Razorpay Live'
                     : 'Verified Sandbox'}
                 </span>
               </div>
@@ -519,7 +574,7 @@ export function PaymentGatewayModal({
           })}
         </div>
 
-        <form onSubmit={handlePayNow} className="p-5 flex flex-col gap-4">
+        <form onSubmit={handleDirectPay} className="p-5 flex flex-col gap-4">
           {errorMsg && (
             <div
               role="alert"
@@ -532,10 +587,43 @@ export function PaymentGatewayModal({
             </div>
           )}
 
+          {/* Optional Razorpay Hosted Popup Launcher when Razorpay Keys are Active */}
+          {isRazorpayConfigured && (
+            <div className="p-3.5 rounded-xl bg-sage-surface/55 border border-light-primary/25 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+              <div className="min-w-0">
+                <div className="font-title text-sm font-semibold text-light-on-surface">
+                  Razorpay Order Ready
+                </div>
+                <p className="font-body text-xs text-light-on-surface-variant">
+                  Launch the official Razorpay popup or complete your test payment right below.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={processing}
+                onClick={handleLaunchRazorpayPopup}
+                className="px-3.5 py-2 rounded-lg bg-white border border-light-primary text-light-primary hover:bg-light-primary hover:text-white font-label text-xs transition-colors shrink-0 cursor-pointer"
+              >
+                Open Razorpay Window
+              </button>
+            </div>
+          )}
+
           {method === 'upi' && (
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-2">
-                <span className="font-label text-label-md text-light-on-surface">Preferred UPI App</span>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-label text-label-md text-light-on-surface">Preferred UPI App</span>
+                  {isSandboxOrTest && (
+                    <button
+                      type="button"
+                      onClick={fillTestDetails}
+                      className="font-label text-xs text-light-primary hover:underline cursor-pointer"
+                    >
+                      Use Test UPI ID
+                    </button>
+                  )}
+                </div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {UPI_APPS.map((app) => (
                     <button
@@ -603,9 +691,22 @@ export function PaymentGatewayModal({
 
           {method === 'card' && (
             <div className="flex flex-col gap-3.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-label text-label-md text-light-on-surface">Debit / Credit Card Details</span>
+                {isSandboxOrTest && (
+                  <button
+                    type="button"
+                    onClick={fillTestDetails}
+                    className="font-label text-xs text-light-primary hover:underline cursor-pointer"
+                  >
+                    Autofill Test Card
+                  </button>
+                )}
+              </div>
+
               <label className="flex flex-col gap-1.5">
                 <div className="flex items-center justify-between">
-                  <span className="font-label text-label-md text-light-on-surface">Card Number</span>
+                  <span className="font-label text-label-sm text-light-on-surface-variant">Card Number</span>
                   <span className="font-label text-xs text-light-primary">{cardBrand}</span>
                 </div>
                 <input
@@ -614,7 +715,7 @@ export function PaymentGatewayModal({
                   autoComplete="cc-number"
                   value={cardNumber}
                   onChange={(e) => handleCardNumberChange(e.target.value)}
-                  placeholder="4532 1900 8421 4242"
+                  placeholder="4111 1111 1111 1111"
                   className="w-full px-3.5 py-2.5 rounded-lg border border-light-outline-variant bg-white text-light-on-surface font-mono text-sm tracking-wider focus:border-light-primary focus:ring-2 focus:ring-light-primary/20 focus:outline-none"
                 />
               </label>
@@ -629,7 +730,7 @@ export function PaymentGatewayModal({
                     maxLength={5}
                     value={cardExpiry}
                     onChange={(e) => handleExpiryChange(e.target.value)}
-                    placeholder="08/28"
+                    placeholder="12/29"
                     className="w-full px-3.5 py-2.5 rounded-lg border border-light-outline-variant bg-white text-light-on-surface font-mono text-sm focus:border-light-primary focus:ring-2 focus:ring-light-primary/20 focus:outline-none"
                   />
                 </label>

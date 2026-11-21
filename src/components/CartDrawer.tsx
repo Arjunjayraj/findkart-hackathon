@@ -110,11 +110,18 @@ export function CartDrawer({
     e.preventDefault();
     setFormError(null);
 
+    let normalizedPhone = phone.replace(/\D/g, '');
+    if (normalizedPhone.length === 12 && normalizedPhone.startsWith('91')) {
+      normalizedPhone = normalizedPhone.slice(2);
+    } else if (normalizedPhone.length === 11 && normalizedPhone.startsWith('0')) {
+      normalizedPhone = normalizedPhone.slice(1);
+    }
+
     if (fullName.trim().length < 2) {
       setFormError('Please enter recipient full name.');
       return;
     }
-    if (!/^[6-9]\d{9}$/.test(phone.replace(/\s+/g, ''))) {
+    if (!/^[6-9]\d{9}$/.test(normalizedPhone)) {
       setFormError('Enter a valid 10-digit Indian mobile number.');
       return;
     }
@@ -133,7 +140,7 @@ export function CartDrawer({
 
     const shipping: OrderShipping = {
       fullName: fullName.trim(),
-      phone: phone.replace(/\s+/g, ''),
+      phone: normalizedPhone,
       address: address.trim(),
       city: city.trim(),
       pincode: pincode.trim(),

@@ -109,5 +109,9 @@
         }
       ]
     }
-  ]
+  ],
+  "stockOverrides": {
+    "home-soundcore-anc": 2
+  },
+  "stockNotifications": []
 }

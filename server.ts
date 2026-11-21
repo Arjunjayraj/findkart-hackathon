@@ -1052,9 +1052,20 @@ async function startServer() {
     res.json({ recentlyViewed: user.recentlyViewed });
   });
 
+  function normalizeIndianPhone(raw: string): string {
+    let digits = raw.replace(/\D/g, '');
+    if (digits.length === 12 && digits.startsWith('91')) {
+      digits = digits.slice(2);
+    } else if (digits.length === 11 && digits.startsWith('0')) {
+      digits = digits.slice(1);
+    }
+    return digits;
+  }
+
   function validateShippingPayload(rawShipping: Record<string, unknown>) {
     const fullName = typeof rawShipping.fullName === 'string' ? rawShipping.fullName.trim() : '';
-    const phone = typeof rawShipping.phone === 'string' ? rawShipping.phone.trim() : '';
+    const rawPhone = typeof rawShipping.phone === 'string' ? rawShipping.phone.trim() : '';
+    const phone = normalizeIndianPhone(rawPhone);
     const address = typeof rawShipping.address === 'string' ? rawShipping.address.trim() : '';
     const city = typeof rawShipping.city === 'string' ? rawShipping.city.trim() : '';
     const pincode = typeof rawShipping.pincode === 'string' ? rawShipping.pincode.trim() : '';
@@ -1062,7 +1073,7 @@ async function startServer() {
     if (fullName.length < 2 || fullName.length > 80) {
       return { error: 'Enter recipient full name.' } as const;
     }
-    if (!/^[6-9]\d{9}$/.test(phone.replace(/\s+/g, ''))) {
+    if (!/^[6-9]\d{9}$/.test(phone)) {
       return { error: 'Enter a valid 10-digit Indian mobile number.' } as const;
     }
     if (address.length < 6 || address.length > 240) {
@@ -1077,7 +1088,7 @@ async function startServer() {
     return {
       shippingBase: {
         fullName,
-        phone: phone.replace(/\s+/g, ''),
+        phone,
         address,
         city,
         pincode,
@@ -1417,7 +1428,12 @@ async function startServer() {
     const rawProof = (body.paymentProof || {}) as Record<string, unknown>;
     let paymentInfo: OrderPaymentInfo;
 
-    if (session.provider === 'razorpay') {
+    const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+    const isRazorpayTestKey = razorpayKeyId.startsWith('rzp_test_');
+    const isRazorpayHostedProof =
+      typeof rawProof.razorpayPaymentId === 'string' && rawProof.razorpayPaymentId.trim().length > 0;
+
+    if (session.provider === 'razorpay' && (isRazorpayHostedProof || !isRazorpayTestKey)) {
       const rpOrderId = typeof rawProof.razorpayOrderId === 'string' ? rawProof.razorpayOrderId.trim() : '';
       const rpPaymentId = typeof rawProof.razorpayPaymentId === 'string' ? rawProof.razorpayPaymentId.trim() : '';
       const rpSignature = typeof rawProof.razorpaySignature === 'string' ? rawProof.razorpaySignature.trim() : '';
@@ -1444,10 +1460,11 @@ async function startServer() {
         transactionId: rpPaymentId,
         paymentStatus: 'Paid',
         methodLabel: 'Online Payment (Razorpay)',
+        maskedDetail: session.razorpayOrderId,
         paidAt: new Date().toISOString(),
       };
     } else {
-      // Server-verified Sandbox Gateway validation (never accepts or stores raw PAN/CVV)
+      // Server-verified In-App Gateway / Razorpay Test Mode validation (never accepts or stores raw PAN/CVV)
       let methodLabel = 'UPI Instant Pay';
       let maskedDetail: string | undefined;
 
@@ -1489,11 +1506,11 @@ async function startServer() {
 
       const txnSuffix = crypto.randomBytes(5).toString('hex').toUpperCase();
       paymentInfo = {
-        gateway: 'FindKart Sandbox',
-        transactionId: `FKPAY-${txnSuffix}`,
+        gateway: session.provider === 'razorpay' ? 'Razorpay' : 'FindKart Sandbox',
+        transactionId: session.provider === 'razorpay' ? `pay_test_${txnSuffix}` : `FKPAY-${txnSuffix}`,
         paymentStatus: 'Paid',
         methodLabel,
-        maskedDetail,
+        maskedDetail: session.razorpayOrderId ? `${maskedDetail || ''} · ${session.razorpayOrderId}` : maskedDetail,
         paidAt: new Date().toISOString(),
       };
     }
