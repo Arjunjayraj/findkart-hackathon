@@ -19,9 +19,12 @@ import type {
   AccountSettings,
   CartItem,
   DeliveryLocation,
+  OnlinePaymentMethod,
   Order,
   OrderItem,
+  OrderPaymentInfo,
   OrderShipping,
+  PaymentGatewayConfig,
   PaymentPreferences,
   SavedAddress,
   StockNotification,
@@ -80,6 +83,49 @@ const PORT = 3000;
 const SESSION_COOKIE_NAME = 'findkart_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const PAYMENT_SIGNING_SECRET = process.env.PAYMENT_SIGNING_SECRET || crypto.randomBytes(32).toString('hex');
+const PAYMENT_SESSION_TTL_MS = 15 * 60 * 1000;
+
+interface PendingPaymentSession {
+  sessionId: string;
+  provider: 'razorpay' | 'stripe' | 'sandbox';
+  userId?: string;
+  items: CartItem[];
+  orderItems: OrderItem[];
+  shipping: OrderShipping;
+  subtotal: number;
+  deliveryFee: number;
+  totalSavings: number;
+  total: number;
+  amountPaise: number;
+  paymentMethod: OnlinePaymentMethod;
+  razorpayOrderId?: string;
+  stripePaymentIntentId?: string;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+const pendingPaymentSessions = new Map<string, PendingPaymentSession>();
+
+function signPaymentSession(sessionId: string, amountPaise: number, method: OnlinePaymentMethod): string {
+  return crypto
+    .createHmac('sha256', PAYMENT_SIGNING_SECRET)
+    .update(`${sessionId}|${amountPaise}|${method}`)
+    .digest('hex');
+}
+
+function pruneExpiredPaymentSessions(): void {
+  const now = Date.now();
+  for (const [id, sess] of pendingPaymentSessions.entries()) {
+    if (sess.expiresAt < now || sess.consumed) {
+      pendingPaymentSessions.delete(id);
+    }
+  }
+  if (pendingPaymentSessions.size > 500) {
+    const oldestKey = pendingPaymentSessions.keys().next().value;
+    if (oldestKey) pendingPaymentSessions.delete(oldestKey);
+  }
+}
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_PATH = path.resolve(DATA_DIR, 'findkart-db.json');
@@ -1007,45 +1053,40 @@ async function startServer() {
     res.json({ recentlyViewed: user.recentlyViewed });
   });
 
-  // Place Order (Works for both authenticated users and guest checkout, calculating totals server-side)
-  app.post('/api/orders', async (req: Request, res: Response) => {
-    if (!verifyMutationHeader(req, res)) return;
-    const body = (req.body || {}) as Record<string, unknown>;
-    const validatedItems = validateCartItems(body.items);
-    if (validatedItems.length === 0) {
-      res.status(400).json({ message: 'Your cart is empty.' });
-      return;
-    }
-
-    const rawShipping = (body.shipping || {}) as Record<string, unknown>;
+  function validateShippingPayload(rawShipping: Record<string, unknown>) {
     const fullName = typeof rawShipping.fullName === 'string' ? rawShipping.fullName.trim() : '';
     const phone = typeof rawShipping.phone === 'string' ? rawShipping.phone.trim() : '';
     const address = typeof rawShipping.address === 'string' ? rawShipping.address.trim() : '';
     const city = typeof rawShipping.city === 'string' ? rawShipping.city.trim() : '';
     const pincode = typeof rawShipping.pincode === 'string' ? rawShipping.pincode.trim() : '';
-    const paymentMethod = rawShipping.paymentMethod === 'upi_on_delivery' ? 'upi_on_delivery' : 'cod';
 
     if (fullName.length < 2 || fullName.length > 80) {
-      res.status(400).json({ message: 'Enter recipient full name.' });
-      return;
+      return { error: 'Enter recipient full name.' } as const;
     }
     if (!/^[6-9]\d{9}$/.test(phone.replace(/\s+/g, ''))) {
-      res.status(400).json({ message: 'Enter a valid 10-digit Indian mobile number.' });
-      return;
+      return { error: 'Enter a valid 10-digit Indian mobile number.' } as const;
     }
     if (address.length < 6 || address.length > 240) {
-      res.status(400).json({ message: 'Enter a complete delivery street address.' });
-      return;
+      return { error: 'Enter a complete delivery street address.' } as const;
     }
     if (city.length < 2 || city.length > 60) {
-      res.status(400).json({ message: 'Enter a valid city name.' });
-      return;
+      return { error: 'Enter a valid city name.' } as const;
     }
     if (!/^\d{6}$/.test(pincode)) {
-      res.status(400).json({ message: 'Enter a valid 6-digit Indian pin code.' });
-      return;
+      return { error: 'Enter a valid 6-digit Indian pin code.' } as const;
     }
+    return {
+      shippingBase: {
+        fullName,
+        phone: phone.replace(/\s+/g, ''),
+        address,
+        city,
+        pincode,
+      },
+    } as const;
+  }
 
+  function computeAuthoritativeOrderTotals(validatedItems: CartItem[]) {
     const productMap = new Map(CATALOG_PRODUCTS.map((p) => [p.id, p]));
     const orderItems: OrderItem[] = [];
     let subtotal = 0;
@@ -1072,36 +1113,46 @@ async function startServer() {
     const deliveryFee = subtotal >= 499 ? 0 : 40;
     const total = subtotal + deliveryFee;
     const totalSavings = Math.max(0, totalMrp - subtotal);
-    const shipping: OrderShipping = {
-      fullName,
-      phone: phone.replace(/\s+/g, ''),
-      address,
-      city,
-      pincode,
-      paymentMethod,
-    };
+    return { productMap, orderItems, subtotal, deliveryFee, total, totalSavings };
+  }
 
+  async function finalizeOrderPlacement(params: {
+    orderItems: OrderItem[];
+    productMap: Map<string, (typeof CATALOG_PRODUCTS)[number]>;
+    shipping: OrderShipping;
+    subtotal: number;
+    deliveryFee: number;
+    totalSavings: number;
+    total: number;
+    userId?: string;
+    paymentInfo?: OrderPaymentInfo;
+  }): Promise<{ order: Order; stockOverrides: Record<string, number> }> {
     const orderNum = 1000 + Math.floor(Math.random() * 9000);
+    const resolvedShipping: OrderShipping = params.paymentInfo
+      ? { ...params.shipping, paymentDetails: params.paymentInfo }
+      : params.shipping;
+
     const order: Order = {
       orderId: `FK-${orderNum}`,
       createdAt: new Date().toISOString(),
-      status: 'Confirmed — Preparing Shipment',
-      items: orderItems,
-      subtotal,
-      deliveryFee,
-      totalSavings,
-      total,
-      shipping,
+      status:
+        params.paymentInfo?.paymentStatus === 'Paid'
+          ? 'Paid · Confirmed — Preparing Shipment'
+          : 'Confirmed — Preparing Shipment',
+      items: params.orderItems,
+      subtotal: params.subtotal,
+      deliveryFee: params.deliveryFee,
+      totalSavings: params.totalSavings,
+      total: params.total,
+      shipping: resolvedShipping,
+      paymentInfo: params.paymentInfo,
     };
-
-    const token = extractToken(req);
-    const claims = token ? verifyToken(token) : null;
 
     if (isPgActive) {
       const overrides = await stockRepo.getStockOverrides();
       const updates: Record<string, number> = {};
-      for (const item of orderItems) {
-        const prod = productMap.get(item.productId);
+      for (const item of params.orderItems) {
+        const prod = params.productMap.get(item.productId);
         if (prod) {
           const currentStock = getProductStock(prod, overrides);
           const newStock = Math.max(0, currentStock - item.quantity);
@@ -1110,15 +1161,14 @@ async function startServer() {
         }
       }
       await stockRepo.batchUpdateStockOverrides(updates);
-      await orderRepo.createOrder(order, claims?.uid);
+      await orderRepo.createOrder(order, params.userId);
 
-      // ── Kafka: publish ORDER_PLACED + per-item STOCK_UPDATED events ──
-      const kafkaUserId = claims?.uid ?? 'guest';
+      const kafkaUserId = params.userId ?? 'guest';
       publishOrderPlaced(order, kafkaUserId).catch((e) =>
         console.warn('[Kafka] ORDER_PLACED publish failed:', e),
       );
-      for (const item of orderItems) {
-        const prod = productMap.get(item.productId);
+      for (const item of params.orderItems) {
+        const prod = params.productMap.get(item.productId);
         if (prod) {
           const newStock = updates[prod.id] ?? 0;
           const prevStock = newStock + item.quantity;
@@ -1128,14 +1178,13 @@ async function startServer() {
         }
       }
 
-      res.status(201).json({ order, stockOverrides: overrides });
-      return;
+      return { order, stockOverrides: overrides };
     }
 
     const db = readDb();
     const overrides = { ...(db.stockOverrides || {}) };
-    for (const item of orderItems) {
-      const prod = productMap.get(item.productId);
+    for (const item of params.orderItems) {
+      const prod = params.productMap.get(item.productId);
       if (prod) {
         const currentStock = getProductStock(prod, overrides);
         overrides[prod.id] = Math.max(0, currentStock - item.quantity);
@@ -1143,23 +1192,22 @@ async function startServer() {
     }
     db.stockOverrides = overrides;
 
-    if (claims) {
-      const user = db.users.find((u) => u.id === claims.uid);
+    if (params.userId) {
+      const user = db.users.find((u) => u.id === params.userId);
       if (user) {
         user.orders.unshift(order);
         user.cart = [];
-        user.location = { city, pincode };
+        user.location = { city: params.shipping.city, pincode: params.shipping.pincode };
       }
     }
     writeDb(db);
 
-    // ── Kafka: publish ORDER_PLACED + per-item STOCK_UPDATED events ──
-    const kafkaUserId = claims?.uid ?? 'guest';
+    const kafkaUserId = params.userId ?? 'guest';
     publishOrderPlaced(order, kafkaUserId).catch((e) =>
       console.warn('[Kafka] ORDER_PLACED publish failed:', e),
     );
-    for (const item of orderItems) {
-      const prod = productMap.get(item.productId);
+    for (const item of params.orderItems) {
+      const prod = params.productMap.get(item.productId);
       if (prod) {
         const prevStock = getProductStock(prod, db.stockOverrides || {}) + item.quantity;
         const newStock = Math.max(0, prevStock - item.quantity);
@@ -1169,17 +1217,443 @@ async function startServer() {
       }
     }
 
-    res.status(201).json({ order, stockOverrides: overrides });
+    return { order, stockOverrides: overrides };
+  }
+
+  // Payment Gateway: Public Configuration (no secrets exposed)
+  app.get('/api/payments/config', (_req: Request, res: Response) => {
+    const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+    const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
+    const stripeSecret = (process.env.STRIPE_SECRET_KEY || '').trim();
+
+    const razorpayReady = Boolean(razorpayKeyId && razorpaySecret);
+    const stripeReady = Boolean(stripeSecret);
+
+    const config: PaymentGatewayConfig = {
+      mode: razorpayReady ? 'live-razorpay' : stripeReady ? 'live-stripe' : 'sandbox',
+      razorpayKeyId: razorpayReady ? razorpayKeyId : undefined,
+      providers: {
+        razorpay: razorpayReady,
+        stripe: stripeReady,
+        sandbox: true,
+      },
+      supportedMethods: ['upi', 'card', 'netbanking', 'wallet', 'cod', 'upi_on_delivery'],
+    };
+
+    res.json(config);
+  });
+
+  // Payment Gateway: Create Authoritative Server Payment Session
+  app.post('/api/payments/create-session', async (req: Request, res: Response) => {
+    if (!verifyMutationHeader(req, res)) return;
+    pruneExpiredPaymentSessions();
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const validatedItems = validateCartItems(body.items);
+    if (validatedItems.length === 0) {
+      res.status(400).json({ message: 'Your cart is empty.' });
+      return;
+    }
+
+    const rawShipping = (body.shipping || {}) as Record<string, unknown>;
+    const shippingCheck = validateShippingPayload(rawShipping);
+    if ('error' in shippingCheck) {
+      res.status(400).json({ message: shippingCheck.error });
+      return;
+    }
+
+    const rawMethod = body.paymentMethod ?? rawShipping.paymentMethod;
+    const allowedMethods: OnlinePaymentMethod[] = ['upi', 'card', 'netbanking', 'wallet'];
+    if (typeof rawMethod !== 'string' || !allowedMethods.includes(rawMethod as OnlinePaymentMethod)) {
+      res.status(400).json({ message: 'Select a valid online payment method (UPI, Card, NetBanking, or Wallet).' });
+      return;
+    }
+    const paymentMethod = rawMethod as OnlinePaymentMethod;
+
+    const { productMap, orderItems, subtotal, deliveryFee, total, totalSavings } =
+      computeAuthoritativeOrderTotals(validatedItems);
+    if (orderItems.length === 0 || total <= 0) {
+      res.status(400).json({ message: 'Unable to calculate order total.' });
+      return;
+    }
+
+    // Verify stock availability before charging
+    const overrides = isPgActive ? await stockRepo.getStockOverrides() : (readDb().stockOverrides || {});
+    for (const item of orderItems) {
+      const prod = productMap.get(item.productId);
+      if (!prod) continue;
+      const available = getProductStock(prod, overrides);
+      if (available < item.quantity) {
+        res.status(409).json({
+          message: `Insufficient stock for ${prod.name}. Only ${available} available.`,
+        });
+        return;
+      }
+    }
+
+    const amountPaise = Math.round(total * 100);
+    const sessionId = `pay_sess_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
+    const expiresAt = Date.now() + PAYMENT_SESSION_TTL_MS;
+    const token = extractToken(req);
+    const claims = token ? verifyToken(token) : null;
+
+    const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
+    const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
+    const stripeSecret = (process.env.STRIPE_SECRET_KEY || '').trim();
+
+    let provider: 'razorpay' | 'stripe' | 'sandbox' = 'sandbox';
+    let razorpayOrderId: string | undefined;
+    let stripePaymentIntentId: string | undefined;
+    let stripeClientSecret: string | undefined;
+
+    if (razorpayKeyId && razorpaySecret) {
+      try {
+        const auth = Buffer.from(`${razorpayKeyId}:${razorpaySecret}`).toString('base64');
+        const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
+          method: 'POST',
+          headers: {
+            Authorization: `Basic ${auth}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            amount: amountPaise,
+            currency: 'INR',
+            receipt: sessionId,
+            notes: {
+              city: shippingCheck.shippingBase.city,
+              pincode: shippingCheck.shippingBase.pincode,
+            },
+          }),
+        });
+        if (rpRes.ok) {
+          const rpData = (await rpRes.json()) as { id?: string };
+          if (rpData.id) {
+            provider = 'razorpay';
+            razorpayOrderId = rpData.id;
+          }
+        }
+      } catch (err) {
+        console.warn('[Payments] Razorpay order creation failed, using sandbox fallback:', err);
+      }
+    } else if (stripeSecret && paymentMethod === 'card') {
+      try {
+        const params = new URLSearchParams({
+          amount: String(amountPaise),
+          currency: 'inr',
+          'automatic_payment_methods[enabled]': 'true',
+          'metadata[sessionId]': sessionId,
+        });
+        const stRes = await fetch('https://api.stripe.com/v1/payment_intents', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${stripeSecret}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: params.toString(),
+        });
+        if (stRes.ok) {
+          const stData = (await stRes.json()) as { id?: string; client_secret?: string };
+          if (stData.id && stData.client_secret) {
+            provider = 'stripe';
+            stripePaymentIntentId = stData.id;
+            stripeClientSecret = stData.client_secret;
+          }
+        }
+      } catch (err) {
+        console.warn('[Payments] Stripe PaymentIntent creation failed, using sandbox fallback:', err);
+      }
+    }
+
+    const session: PendingPaymentSession = {
+      sessionId,
+      provider,
+      userId: claims?.uid,
+      items: validatedItems,
+      orderItems,
+      shipping: {
+        ...shippingCheck.shippingBase,
+        paymentMethod,
+      },
+      subtotal,
+      deliveryFee,
+      totalSavings,
+      total,
+      amountPaise,
+      paymentMethod,
+      razorpayOrderId,
+      stripePaymentIntentId,
+      expiresAt,
+      consumed: false,
+    };
+    pendingPaymentSessions.set(sessionId, session);
+
+    const signature = signPaymentSession(sessionId, amountPaise, paymentMethod);
+    res.status(201).json({
+      sessionId,
+      signature,
+      provider,
+      amount: total,
+      amountPaise,
+      currency: 'INR',
+      expiresAt: new Date(expiresAt).toISOString(),
+      razorpayOrderId,
+      razorpayKeyId: provider === 'razorpay' ? razorpayKeyId : undefined,
+      stripeClientSecret,
+    });
+  });
+
+  // Payment Gateway: Verify Payment & Place Order (Single-Use Server-Verified)
+  app.post('/api/payments/verify-and-place-order', async (req: Request, res: Response) => {
+    if (!verifyMutationHeader(req, res)) return;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+    const signature = typeof body.signature === 'string' ? body.signature.trim() : '';
+
+    if (!sessionId || !signature) {
+      res.status(400).json({ message: 'Missing payment session credentials.' });
+      return;
+    }
+
+    const session = pendingPaymentSessions.get(sessionId);
+    if (!session) {
+      res.status(404).json({ message: 'Payment session expired or invalid. Please retry checkout.' });
+      return;
+    }
+    if (session.expiresAt < Date.now()) {
+      pendingPaymentSessions.delete(sessionId);
+      res.status(410).json({ message: 'Payment session expired. Please initiate a fresh payment.' });
+      return;
+    }
+    if (session.consumed) {
+      res.status(409).json({ message: 'This payment session has already been processed.' });
+      return;
+    }
+
+    const expectedSig = signPaymentSession(session.sessionId, session.amountPaise, session.paymentMethod);
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      res.status(403).json({ message: 'Payment session verification failed.' });
+      return;
+    }
+
+    const token = extractToken(req);
+    const claims = token ? verifyToken(token) : null;
+    if (session.userId && claims?.uid !== session.userId) {
+      res.status(403).json({ message: 'Authenticated user does not match payment session owner.' });
+      return;
+    }
+
+    const methodOverride =
+      typeof body.paymentMethod === 'string' &&
+      (['upi', 'card', 'netbanking', 'wallet'] as string[]).includes(body.paymentMethod)
+        ? (body.paymentMethod as OnlinePaymentMethod)
+        : session.paymentMethod;
+
+    const rawProof = (body.paymentProof || {}) as Record<string, unknown>;
+    let paymentInfo: OrderPaymentInfo;
+
+    if (session.provider === 'razorpay') {
+      const rpOrderId = typeof rawProof.razorpayOrderId === 'string' ? rawProof.razorpayOrderId.trim() : '';
+      const rpPaymentId = typeof rawProof.razorpayPaymentId === 'string' ? rawProof.razorpayPaymentId.trim() : '';
+      const rpSignature = typeof rawProof.razorpaySignature === 'string' ? rawProof.razorpaySignature.trim() : '';
+      const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
+
+      if (!razorpaySecret || !rpOrderId || !rpPaymentId || !rpSignature || rpOrderId !== session.razorpayOrderId) {
+        res.status(400).json({ message: 'Invalid Razorpay payment verification payload.' });
+        return;
+      }
+
+      const generatedSig = crypto
+        .createHmac('sha256', razorpaySecret)
+        .update(`${rpOrderId}|${rpPaymentId}`)
+        .digest('hex');
+      const rpBuf = Buffer.from(rpSignature);
+      const genBuf = Buffer.from(generatedSig);
+      if (rpBuf.length !== genBuf.length || !crypto.timingSafeEqual(rpBuf, genBuf)) {
+        res.status(403).json({ message: 'Razorpay payment signature verification failed.' });
+        return;
+      }
+
+      paymentInfo = {
+        gateway: 'Razorpay',
+        transactionId: rpPaymentId,
+        paymentStatus: 'Paid',
+        methodLabel: 'Online Payment (Razorpay)',
+        paidAt: new Date().toISOString(),
+      };
+    } else if (session.provider === 'stripe') {
+      const stripeSecret = (process.env.STRIPE_SECRET_KEY || '').trim();
+      const intentId = session.stripePaymentIntentId;
+      if (!stripeSecret || !intentId) {
+        res.status(400).json({ message: 'Stripe payment intent unavailable.' });
+        return;
+      }
+      const stRes = await fetch(`https://api.stripe.com/v1/payment_intents/${encodeURIComponent(intentId)}`, {
+        headers: { Authorization: `Bearer ${stripeSecret}` },
+      });
+      if (!stRes.ok) {
+        res.status(402).json({ message: 'Unable to verify Stripe payment status.' });
+        return;
+      }
+      const stData = (await stRes.json()) as { status?: string; amount?: number };
+      if (stData.status !== 'succeeded' || stData.amount !== session.amountPaise) {
+        res.status(402).json({ message: 'Stripe payment has not succeeded.' });
+        return;
+      }
+      paymentInfo = {
+        gateway: 'Stripe',
+        transactionId: intentId,
+        paymentStatus: 'Paid',
+        methodLabel: 'Card (Stripe)',
+        paidAt: new Date().toISOString(),
+      };
+    } else {
+      // Server-verified Sandbox Gateway validation (never accepts or stores raw PAN/CVV)
+      let methodLabel = 'UPI Instant Pay';
+      let maskedDetail: string | undefined;
+
+      if (methodOverride === 'upi') {
+        const upiId = typeof rawProof.upiId === 'string' ? rawProof.upiId.trim() : '';
+        const upiApp = typeof rawProof.upiApp === 'string' ? rawProof.upiApp.trim().slice(0, 32) : '';
+        if (!/^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(upiId)) {
+          res.status(400).json({ message: 'Enter a valid UPI ID (e.g., name@okaxis).' });
+          return;
+        }
+        methodLabel = upiApp ? `UPI (${upiApp})` : 'UPI Instant Pay';
+        maskedDetail = upiId;
+      } else if (methodOverride === 'card') {
+        const last4 = typeof rawProof.cardLast4 === 'string' ? rawProof.cardLast4.trim() : '';
+        const cardBrand = typeof rawProof.cardBrand === 'string' ? rawProof.cardBrand.trim().slice(0, 24) : 'Card';
+        if (!/^\d{4}$/.test(last4)) {
+          res.status(400).json({ message: 'Invalid tokenized card verification details.' });
+          return;
+        }
+        methodLabel = `${cardBrand} Card`;
+        maskedDetail = `•••• ${last4}`;
+      } else if (methodOverride === 'netbanking') {
+        const bankName = typeof rawProof.bankName === 'string' ? rawProof.bankName.trim().slice(0, 48) : '';
+        if (bankName.length < 2) {
+          res.status(400).json({ message: 'Select a bank to authorize NetBanking payment.' });
+          return;
+        }
+        methodLabel = 'NetBanking';
+        maskedDetail = bankName;
+      } else if (methodOverride === 'wallet') {
+        const walletName = typeof rawProof.walletName === 'string' ? rawProof.walletName.trim().slice(0, 40) : '';
+        if (walletName.length < 2) {
+          res.status(400).json({ message: 'Select a digital wallet to complete payment.' });
+          return;
+        }
+        methodLabel = 'Digital Wallet';
+        maskedDetail = walletName;
+      }
+
+      const txnSuffix = crypto.randomBytes(5).toString('hex').toUpperCase();
+      paymentInfo = {
+        gateway: 'FindKart Sandbox',
+        transactionId: `FKPAY-${txnSuffix}`,
+        paymentStatus: 'Paid',
+        methodLabel,
+        maskedDetail,
+        paidAt: new Date().toISOString(),
+      };
+    }
+
+    // Mark session consumed atomically before database/file persistence
+    session.consumed = true;
+    session.shipping.paymentMethod = methodOverride;
+
+    const productMap = new Map(CATALOG_PRODUCTS.map((p) => [p.id, p]));
+    const { order, stockOverrides } = await finalizeOrderPlacement({
+      orderItems: session.orderItems,
+      productMap,
+      shipping: session.shipping,
+      subtotal: session.subtotal,
+      deliveryFee: session.deliveryFee,
+      totalSavings: session.totalSavings,
+      total: session.total,
+      userId: claims?.uid || session.userId,
+      paymentInfo,
+    });
+
+    pendingPaymentSessions.delete(sessionId);
+    res.status(201).json({ order, stockOverrides, paymentInfo });
+  });
+
+  // Place Order (Doorstep Payment: Cash on Delivery or UPI on Delivery)
+  app.post('/api/orders', async (req: Request, res: Response) => {
+    if (!verifyMutationHeader(req, res)) return;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const validatedItems = validateCartItems(body.items);
+    if (validatedItems.length === 0) {
+      res.status(400).json({ message: 'Your cart is empty.' });
+      return;
+    }
+
+    const rawShipping = (body.shipping || {}) as Record<string, unknown>;
+    const shippingCheck = validateShippingPayload(rawShipping);
+    if ('error' in shippingCheck) {
+      res.status(400).json({ message: shippingCheck.error });
+      return;
+    }
+
+    if (rawShipping.paymentMethod !== 'cod' && rawShipping.paymentMethod !== 'upi_on_delivery') {
+      res.status(400).json({
+        message: 'Online payments must complete verification via the payment gateway.',
+      });
+      return;
+    }
+    const paymentMethod = rawShipping.paymentMethod;
+
+    const { productMap, orderItems, subtotal, deliveryFee, total, totalSavings } =
+      computeAuthoritativeOrderTotals(validatedItems);
+
+    const shipping: OrderShipping = {
+      ...shippingCheck.shippingBase,
+      paymentMethod,
+    };
+
+    const paymentInfo: OrderPaymentInfo = {
+      gateway: 'Pay on Delivery',
+      transactionId: `COD-${crypto.randomBytes(3).toString('hex').toUpperCase()}`,
+      paymentStatus: 'Pay on Delivery',
+      methodLabel: paymentMethod === 'upi_on_delivery' ? 'UPI on Delivery' : 'Cash on Delivery',
+    };
+
+    const token = extractToken(req);
+    const claims = token ? verifyToken(token) : null;
+
+    const { order, stockOverrides } = await finalizeOrderPlacement({
+      orderItems,
+      productMap,
+      shipping,
+      subtotal,
+      deliveryFee,
+      totalSavings,
+      total,
+      userId: claims?.uid,
+      paymentInfo,
+    });
+
+    res.status(201).json({ order, stockOverrides });
   });
 
   // Get Orders for authenticated user
   app.get('/api/orders', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     if (isPgActive && req.authUser) {
-      const orders = await orderRepo.getOrdersByUserId(req.authUser.id);
+      const orders = (await orderRepo.getOrdersByUserId(req.authUser.id)).map((o) => ({
+        ...o,
+        paymentInfo: o.paymentInfo || o.shipping?.paymentDetails,
+      }));
       res.json({ orders });
       return;
     }
-    res.json({ orders: req.authUser?.orders || [] });
+    const orders = (req.authUser?.orders || []).map((o) => ({
+      ...o,
+      paymentInfo: o.paymentInfo || o.shipping?.paymentDetails,
+    }));
+    res.json({ orders });
   });
 
   // Update Order Status (Cancel or Request Return for authenticated user's order)

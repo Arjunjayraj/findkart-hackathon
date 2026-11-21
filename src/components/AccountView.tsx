@@ -922,8 +922,14 @@ export function AccountView({
                     const isCancelled = order.status.toLowerCase().includes('cancelled');
                     const isReturnRequested = order.status.toLowerCase().includes('return');
                     const isTrackingExpanded = expandedTrackOrderId === order.orderId;
-                    const paymentLabel =
-                      order.shipping.paymentMethod === 'cod' ? 'Cash on Delivery' : 'UPI on Delivery';
+                    const resolvedPayInfo = order.paymentInfo || order.shipping.paymentDetails;
+                    const paymentLabel = resolvedPayInfo
+                      ? `${resolvedPayInfo.methodLabel}${resolvedPayInfo.maskedDetail ? ` (${resolvedPayInfo.maskedDetail})` : ''}`
+                      : order.shipping.paymentMethod === 'cod'
+                        ? 'Cash on Delivery'
+                        : order.shipping.paymentMethod === 'upi_on_delivery'
+                          ? 'UPI on Delivery'
+                          : 'Paid Online';
 
                     return (
                       <article

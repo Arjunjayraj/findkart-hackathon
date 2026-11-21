@@ -105,7 +105,17 @@ export function OrdersModal({
                     ))}
                   </div>
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-light-outline-variant/40 font-title text-title-md text-light-on-surface">
-                    <span>Total ({order.shipping.paymentMethod === 'cod' ? 'COD' : 'UPI'})</span>
+                    <span className="text-body-sm font-label text-light-primary">
+                      {(order.paymentInfo || order.shipping.paymentDetails)?.methodLabel ||
+                        (order.shipping.paymentMethod === 'cod'
+                          ? 'Cash on Delivery'
+                          : order.shipping.paymentMethod === 'upi_on_delivery'
+                            ? 'UPI on Delivery'
+                            : 'Paid Online')}
+                      {(order.paymentInfo || order.shipping.paymentDetails)?.paymentStatus === 'Paid'
+                        ? ' · Paid'
+                        : ''}
+                    </span>
                     <div className="flex items-center gap-3">
                       <span className="tabular-nums">₹{order.total.toLocaleString('en-IN')}</span>
                       {onContactSupport && (

@@ -218,7 +218,11 @@ export async function fallbackLogin(params: {
   };
 }
 
-export function fallbackPlaceOrder(items: CartItem[], shipping: OrderShipping): Order {
+export function fallbackPlaceOrder(
+  items: CartItem[],
+  shipping: OrderShipping,
+  paymentInfo?: Order['paymentInfo']
+): Order {
   const productMap = new Map(CATALOG_PRODUCTS.map((p) => [p.id, p]));
   const orderItems: OrderItem[] = [];
   let subtotal = 0;
@@ -244,16 +248,21 @@ export function fallbackPlaceOrder(items: CartItem[], shipping: OrderShipping): 
 
   const deliveryFee = subtotal >= 499 ? 0 : 40;
   const orderNum = 1000 + Math.floor(Math.random() * 9000);
+  const resolvedShipping: OrderShipping = paymentInfo
+    ? { ...shipping, paymentDetails: paymentInfo }
+    : shipping;
+
   return {
     orderId: `FK-${orderNum}`,
     createdAt: new Date().toISOString(),
-    status: 'Confirmed — Preparing Shipment',
+    status: paymentInfo?.paymentStatus === 'Paid' ? 'Paid · Confirmed — Preparing Shipment' : 'Confirmed — Preparing Shipment',
     items: orderItems,
     subtotal,
     deliveryFee,
     totalSavings: Math.max(0, totalMrp - subtotal),
     total: subtotal + deliveryFee,
-    shipping,
+    shipping: resolvedShipping,
+    paymentInfo,
   };
 }
 
