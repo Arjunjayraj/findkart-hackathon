@@ -212,15 +212,25 @@ export async function initPostgresDatabase(): Promise<{ success: boolean; messag
             // Also migrate user orders
             if (Array.isArray(u.orders)) {
               for (const ord of u.orders) {
+                const pInfo = ord.paymentInfo || ord.shipping?.paymentDetails || {};
                 await query(
-                  `INSERT INTO orders (order_id, user_id, created_at, status, subtotal, delivery_fee, total_savings, total, shipping, items)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb)
+                  `INSERT INTO orders (
+                    order_id, user_id, created_at, status,
+                    payment_status, payment_method, payment_gateway, payment_info, paid_at,
+                    subtotal, delivery_fee, total_savings, total, shipping, items
+                  )
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb)
                    ON CONFLICT (order_id) DO NOTHING`,
                   [
                     ord.orderId,
                     u.id,
                     ord.createdAt || new Date().toISOString(),
                     ord.status || 'Confirmed',
+                    pInfo.paymentStatus || 'Pay on Delivery',
+                    ord.shipping?.paymentMethod || 'cod',
+                    pInfo.gateway || null,
+                    JSON.stringify(pInfo),
+                    pInfo.paidAt || null,
                     ord.subtotal || 0,
                     ord.deliveryFee || 0,
                     ord.totalSavings || 0,

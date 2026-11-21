@@ -94,7 +94,8 @@ export async function findUserByEmail(email: string): Promise<StoredUser | null>
     `SELECT order_id as "orderId", created_at as "createdAt", status,
             subtotal::float, delivery_fee::float as "deliveryFee",
             total_savings::float as "totalSavings", total::float,
-            shipping, items
+            shipping, items,
+            COALESCE(NULLIF(payment_info, '{}'::jsonb), shipping->'paymentDetails') as "paymentInfo"
      FROM orders
      WHERE user_id = $1
      ORDER BY created_at DESC`,
@@ -125,7 +126,8 @@ export async function findUserById(id: string): Promise<StoredUser | null> {
     `SELECT order_id as "orderId", created_at as "createdAt", status,
             subtotal::float, delivery_fee::float as "deliveryFee",
             total_savings::float as "totalSavings", total::float,
-            shipping, items
+            shipping, items,
+            COALESCE(NULLIF(payment_info, '{}'::jsonb), shipping->'paymentDetails') as "paymentInfo"
      FROM orders
      WHERE user_id = $1
      ORDER BY created_at DESC`,

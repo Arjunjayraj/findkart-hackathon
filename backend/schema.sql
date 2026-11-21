@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS orders (
   user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   status VARCHAR(100) NOT NULL,
+  payment_status VARCHAR(40) NOT NULL DEFAULT 'Pending',
+  payment_method VARCHAR(40) NOT NULL DEFAULT 'cod',
+  payment_gateway VARCHAR(40),
+  razorpay_order_id VARCHAR(80),
+  razorpay_payment_id VARCHAR(80),
+  razorpay_signature VARCHAR(160),
+  payment_info JSONB DEFAULT '{}'::jsonb,
+  paid_at TIMESTAMPTZ,
   subtotal NUMERIC(10, 2) NOT NULL,
   delivery_fee NUMERIC(10, 2) NOT NULL,
   total_savings NUMERIC(10, 2) NOT NULL,
@@ -32,8 +40,41 @@ CREATE TABLE IF NOT EXISTS orders (
   items JSONB NOT NULL
 );
 
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status VARCHAR(40) NOT NULL DEFAULT 'Pending';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(40) NOT NULL DEFAULT 'cod';
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_gateway VARCHAR(40);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS razorpay_order_id VARCHAR(80);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS razorpay_payment_id VARCHAR(80);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS razorpay_signature VARCHAR(160);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_info JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_razorpay_order_id ON orders(razorpay_order_id);
+
+-- 2b. Payments Ledger Table (tracks Razorpay orders created before payment verification)
+CREATE TABLE IF NOT EXISTS payments (
+  session_id VARCHAR(64) PRIMARY KEY,
+  order_id VARCHAR(50) REFERENCES orders(order_id) ON DELETE SET NULL,
+  user_id VARCHAR(64) REFERENCES users(id) ON DELETE SET NULL,
+  provider VARCHAR(32) NOT NULL,
+  razorpay_order_id VARCHAR(80),
+  razorpay_payment_id VARCHAR(80),
+  razorpay_signature VARCHAR(160),
+  payment_method VARCHAR(32) NOT NULL,
+  amount NUMERIC(10, 2) NOT NULL,
+  amount_paise INTEGER NOT NULL,
+  currency VARCHAR(8) NOT NULL DEFAULT 'INR',
+  status VARCHAR(32) NOT NULL DEFAULT 'created',
+  payment_details JSONB DEFAULT '{}'::jsonb,
+  verified_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payments_rp_order_id ON payments(razorpay_order_id);
+CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
 
 -- 3. Customer Care Support Tickets Table
 CREATE TABLE IF NOT EXISTS support_tickets (

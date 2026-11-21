@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import type {
   CartItem,
   OnlinePaymentMethod,
@@ -84,16 +85,40 @@ function detectCardBrand(digits: string): string {
 }
 
 function loadRazorpayScript(): Promise<boolean> {
-  if (typeof window !== 'undefined' && window.Razorpay) {
-    return Promise.resolve(true);
-  }
+  if (typeof window === 'undefined') return Promise.resolve(false);
+  if (window.Razorpay) return Promise.resolve(true);
+
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (!settled) {
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(ok);
+      }
+    };
+
+    const timer = window.setTimeout(() => finish(Boolean(window.Razorpay)), 6000);
+    const existing = document.querySelector<HTMLScriptElement>(
+      'script[src="https://checkout.razorpay.com/v1/checkout.js"]'
+    );
+
+    if (existing) {
+      if (window.Razorpay) {
+        finish(true);
+        return;
+      }
+      existing.addEventListener('load', () => finish(Boolean(window.Razorpay)), { once: true });
+      existing.addEventListener('error', () => finish(false), { once: true });
+      return;
+    }
+
     const script = document.createElement('script');
     script.src = 'https://checkout.razorpay.com/v1/checkout.js';
     script.async = true;
-    script.onload = () => resolve(true);
-    script.onerror = () => resolve(false);
-    document.body.appendChild(script);
+    script.onload = () => finish(Boolean(window.Razorpay));
+    script.onerror = () => finish(false);
+    document.head.appendChild(script);
   });
 }
 
@@ -113,8 +138,12 @@ export function PaymentGatewayModal({
   const [gatewayConfig, setGatewayConfig] = useState<PaymentGatewayConfig | null>(null);
 
   // UPI state
+  const [upiMode, setUpiMode] = useState<'qr' | 'vpa'>('qr');
   const [upiApp, setUpiApp] = useState('Google Pay');
   const [upiId, setUpiId] = useState(user?.paymentPreferences?.upiId || '');
+  const [merchantUpiInput, setMerchantUpiInput] = useState('findkart@icici');
+  const [editingMerchantUpi, setEditingMerchantUpi] = useState(false);
+  const [copiedUpi, setCopiedUpi] = useState(false);
 
   // Card state (kept only in memory; raw PAN/CVV never persisted or transmitted)
   const [cardNumber, setCardNumber] = useState('');
@@ -128,6 +157,7 @@ export function PaymentGatewayModal({
 
   const [processing, setProcessing] = useState(false);
   const [razorpayWidgetOpen, setRazorpayWidgetOpen] = useState(false);
+  const [showInAppTestFallback, setShowInAppTestFallback] = useState(false);
   const [stageLabel, setStageLabel] = useState('Connecting to Payment Gateway...');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -137,6 +167,9 @@ export function PaymentGatewayModal({
     setErrorMsg(null);
     setProcessing(false);
     setRazorpayWidgetOpen(false);
+    setShowInAppTestFallback(false);
+    setEditingMerchantUpi(false);
+    setCopiedUpi(false);
     if (!upiId && user?.paymentPreferences?.upiId) {
       setUpiId(user.paymentPreferences.upiId);
     }
@@ -150,6 +183,9 @@ export function PaymentGatewayModal({
       .then((parsed) => {
         if (!cancelled && parsed.ok && parsed.data) {
           setGatewayConfig(parsed.data);
+          if (parsed.data.merchantUpiId) {
+            setMerchantUpiInput(parsed.data.merchantUpiId);
+          }
         }
       })
       .catch(() => {
@@ -160,6 +196,23 @@ export function PaymentGatewayModal({
       cancelled = true;
     };
   }, [isOpen, initialMethod, shipping.fullName, user?.name, user?.paymentPreferences?.upiId]);
+
+  const upiVpaRegex = /^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/;
+  const activeMerchantUpiId = upiVpaRegex.test(merchantUpiInput.trim())
+    ? merchantUpiInput.trim()
+    : gatewayConfig?.merchantUpiId || 'findkart@icici';
+  const merchantDisplayName = gatewayConfig?.merchantName || 'FindKart';
+
+  const upiQrPayload = useMemo(() => {
+    const params = new URLSearchParams({
+      pa: activeMerchantUpiId,
+      pn: merchantDisplayName,
+      am: amount.toFixed(2),
+      cu: 'INR',
+      tn: `FindKart Order (${itemCount} item${itemCount === 1 ? '' : 's'})`,
+    });
+    return `upi://pay?${params.toString()}`;
+  }, [activeMerchantUpiId, merchantDisplayName, amount, itemCount]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -210,7 +263,11 @@ export function PaymentGatewayModal({
 
   const validateCurrentMethod = (): string | null => {
     if (method === 'upi') {
-      if (!/^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(upiId.trim())) {
+      if (upiMode === 'qr') {
+        if (!upiVpaRegex.test(merchantUpiInput.trim())) {
+          return 'Enter a valid receiver UPI ID (e.g., findkart@icici or yourname@okaxis) to generate the QR code.';
+        }
+      } else if (!upiVpaRegex.test(upiId.trim())) {
         return 'Enter a valid UPI ID (e.g., arjun@okaxis or success@razorpay).';
       }
     } else if (method === 'card') {
@@ -272,15 +329,8 @@ export function PaymentGatewayModal({
     return { headers, shippingPayload, parsedCreate };
   };
 
-  const handleDirectPay = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const executeInAppVerifiedPayment = async () => {
     setErrorMsg(null);
-
-    if (isRazorpayConfigured && !isRazorpayTestMode) {
-      await handleLaunchRazorpayPopup();
-      return;
-    }
-
     const validationErr = validateCurrentMethod();
     if (validationErr) {
       setErrorMsg(validationErr);
@@ -301,7 +351,9 @@ export function PaymentGatewayModal({
           paymentStatus: 'Paid',
           methodLabel:
             method === 'upi'
-              ? `UPI (${upiApp})`
+              ? upiMode === 'qr'
+                ? `UPI QR (${upiApp})`
+                : `UPI (${upiApp})`
               : method === 'card'
                 ? `${cardBrand} Card`
                 : method === 'netbanking'
@@ -309,7 +361,9 @@ export function PaymentGatewayModal({
                   : 'Digital Wallet',
           maskedDetail:
             method === 'upi'
-              ? upiId.trim()
+              ? upiMode === 'qr'
+                ? `QR · ${activeMerchantUpiId}`
+                : upiId.trim()
               : method === 'card'
                 ? `•••• ${last4}`
                 : method === 'netbanking'
@@ -336,7 +390,9 @@ export function PaymentGatewayModal({
 
       const paymentProof: Record<string, string> =
         method === 'upi'
-          ? { upiId: upiId.trim(), upiApp }
+          ? upiMode === 'qr'
+            ? { upiMode: 'qr', payeeUpiId: activeMerchantUpiId, upiApp }
+            : { upiMode: 'vpa', upiId: upiId.trim(), upiApp }
           : method === 'card'
             ? { cardLast4: rawCardDigits.slice(-4), cardBrand }
             : method === 'netbanking'
@@ -372,6 +428,19 @@ export function PaymentGatewayModal({
     } finally {
       setProcessing(false);
     }
+  };
+
+  const handleDirectPay = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+
+    const isDirectQrConfirm = method === 'upi' && upiMode === 'qr';
+    if (isRazorpayConfigured && !isDirectQrConfirm) {
+      await handleLaunchRazorpayPopup();
+      return;
+    }
+
+    await executeInAppVerifiedPayment();
   };
 
   const handleLaunchRazorpayPopup = async () => {
@@ -463,6 +532,9 @@ export function PaymentGatewayModal({
       });
     } catch (err) {
       setRazorpayWidgetOpen(false);
+      if (isRazorpayTestMode) {
+        setShowInAppTestFallback(true);
+      }
       setErrorMsg(err instanceof Error ? err.message : 'Unable to launch Razorpay Checkout.');
     } finally {
       setProcessing(false);
@@ -578,24 +650,38 @@ export function PaymentGatewayModal({
           {errorMsg && (
             <div
               role="alert"
-              className="p-3 rounded-lg bg-light-error-container border border-light-error/30 text-light-on-error-container font-body text-sm flex items-start gap-2"
+              className="p-3 rounded-lg bg-light-error-container border border-light-error/30 text-light-on-error-container font-body text-sm flex flex-col gap-2"
             >
-              <span className="material-symbols-outlined text-[18px] shrink-0 mt-0.5" aria-hidden="true">
-                error
-              </span>
-              <span>{errorMsg}</span>
+              <div className="flex items-start gap-2">
+                <span className="material-symbols-outlined text-[18px] shrink-0 mt-0.5" aria-hidden="true">
+                  error
+                </span>
+                <span>{errorMsg}</span>
+              </div>
+              {showInAppTestFallback && isRazorpayTestMode && (
+                <div className="pl-6">
+                  <button
+                    type="button"
+                    disabled={processing}
+                    onClick={executeInAppVerifiedPayment}
+                    className="px-3 py-1.5 rounded-md bg-light-primary text-light-on-primary font-label text-xs hover:bg-light-primary-container cursor-pointer"
+                  >
+                    Authorize In-App Test Payment
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
-          {/* Optional Razorpay Hosted Popup Launcher when Razorpay Keys are Active */}
+          {/* Razorpay Standard Checkout Launcher when Razorpay Keys are Active */}
           {isRazorpayConfigured && (
             <div className="p-3.5 rounded-xl bg-sage-surface/55 border border-light-primary/25 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
               <div className="min-w-0">
                 <div className="font-title text-sm font-semibold text-light-on-surface">
-                  Razorpay Order Ready
+                  Razorpay Standard Checkout Ready
                 </div>
                 <p className="font-body text-xs text-light-on-surface-variant">
-                  Launch the official Razorpay popup or complete your test payment right below.
+                  Supports UPI, UPI QR, Cards, NetBanking &amp; Wallets in {isRazorpayTestMode ? 'Test Mode' : 'Live Mode'}.
                 </p>
               </div>
               <button
@@ -611,81 +697,187 @@ export function PaymentGatewayModal({
 
           {method === 'upi' && (
             <div className="flex flex-col gap-4">
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-label text-label-md text-light-on-surface">Preferred UPI App</span>
-                  {isSandboxOrTest && (
-                    <button
-                      type="button"
-                      onClick={fillTestDetails}
-                      className="font-label text-xs text-light-primary hover:underline cursor-pointer"
-                    >
-                      Use Test UPI ID
-                    </button>
-                  )}
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {UPI_APPS.map((app) => (
-                    <button
-                      key={app}
-                      type="button"
-                      onClick={() => setUpiApp(app)}
-                      className={`px-3 py-2 rounded-lg border text-xs font-label transition-colors cursor-pointer ${
-                        upiApp === app
-                          ? 'bg-light-primary text-light-on-primary border-light-primary'
-                          : 'bg-light-surface-container-low border-light-outline-variant text-light-on-surface hover:border-light-primary/50'
-                      }`}
-                    >
-                      {app}
-                    </button>
-                  ))}
-                </div>
+              {/* Sub-mode switcher: Scan QR Code vs Enter UPI ID */}
+              <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-light-surface-container-low border border-light-outline-variant/60">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUpiMode('qr');
+                    setErrorMsg(null);
+                  }}
+                  className={`py-2 px-3 rounded-lg font-label text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    upiMode === 'qr'
+                      ? 'bg-light-primary text-light-on-primary shadow-xs'
+                      : 'text-light-on-surface-variant hover:text-light-on-surface'
+                  }`}
+                >
+                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
+                    qr_code_2
+                  </span>
+                  Scan UPI QR Code
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUpiMode('vpa');
+                    setErrorMsg(null);
+                  }}
+                  className={`py-2 px-3 rounded-lg font-label text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                    upiMode === 'vpa'
+                      ? 'bg-light-primary text-light-on-primary shadow-xs'
+                      : 'text-light-on-surface-variant hover:text-light-on-surface'
+                  }`}
+                >
+                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
+                    alternate_email
+                  </span>
+                  Enter UPI ID / VPA
+                </button>
               </div>
 
-              <label className="flex flex-col gap-1.5">
-                <span className="font-label text-label-md text-light-on-surface">
-                  Enter your UPI ID / VPA
-                </span>
-                <input
-                  type="text"
-                  value={upiId}
-                  onChange={(e) => setUpiId(e.target.value)}
-                  placeholder="arjun@okaxis"
-                  autoComplete="off"
-                  className="w-full px-3.5 py-2.5 rounded-lg border border-light-outline-variant bg-white text-light-on-surface font-mono text-sm focus:border-light-primary focus:ring-2 focus:ring-light-primary/20 focus:outline-none"
-                />
-                <span className="font-body text-xs text-light-on-surface-variant">
-                  Zero convenience fee · Instant payment confirmation via NPCI UPI
-                </span>
-              </label>
+              {upiMode === 'qr' ? (
+                <div className="p-4 rounded-xl bg-[#F4F1EA] border border-light-outline-variant/70 flex flex-col sm:flex-row items-center gap-4">
+                  <div className="p-2.5 rounded-xl bg-white border border-light-outline-variant shadow-xs shrink-0 flex flex-col items-center gap-1.5">
+                    <QRCodeSVG
+                      value={upiQrPayload}
+                      size={156}
+                      level="M"
+                      bgColor="#FFFFFF"
+                      fgColor="#0E3426"
+                      includeMargin={false}
+                      title={`UPI QR Code for ${activeMerchantUpiId}`}
+                    />
+                    <span className="font-label text-[10px] tracking-wide text-light-on-surface-variant uppercase">
+                      Scan with any UPI App
+                    </span>
+                  </div>
 
-              {/* Quick QR Summary Box */}
-              <div className="p-3.5 rounded-xl bg-[#F4F1EA] border border-light-outline-variant/60 flex items-center gap-4">
-                <div className="w-16 h-16 rounded-lg bg-white p-1.5 border border-light-outline-variant/60 shrink-0 flex items-center justify-center">
-                  <svg viewBox="0 0 36 36" className="w-full h-full" aria-hidden="true">
-                    <rect x="2" y="2" width="10" height="10" rx="1.5" fill="none" stroke="#0E3426" strokeWidth="2.4" />
-                    <rect x="5" y="5" width="4" height="4" fill="#0E3426" />
-                    <rect x="24" y="2" width="10" height="10" rx="1.5" fill="none" stroke="#0E3426" strokeWidth="2.4" />
-                    <rect x="27" y="5" width="4" height="4" fill="#0E3426" />
-                    <rect x="2" y="24" width="10" height="10" rx="1.5" fill="none" stroke="#0E3426" strokeWidth="2.4" />
-                    <rect x="5" y="27" width="4" height="4" fill="#0E3426" />
-                    <rect x="16" y="4" width="4" height="4" fill="#0E3426" />
-                    <rect x="15" y="14" width="6" height="6" rx="1" fill="#0E3426" />
-                    <rect x="24" y="16" width="4" height="4" fill="#0E3426" />
-                    <rect x="29" y="23" width="5" height="5" fill="#0E3426" />
-                    <rect x="17" y="25" width="7" height="4" fill="#0E3426" />
-                    <rect x="15" y="31" width="11" height="3" fill="#0E3426" />
-                  </svg>
+                  <div className="flex flex-col gap-2 min-w-0 flex-1 w-full">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-title text-sm font-semibold text-light-on-surface">
+                        Pay ₹{amount.toLocaleString('en-IN')} via UPI QR
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-sage-surface text-light-primary font-label text-[10px] font-semibold">
+                        BHIM · GPay · PhonePe
+                      </span>
+                    </div>
+
+                    <p className="font-body text-xs text-light-on-surface-variant leading-relaxed">
+                      Scan this QR code in Google Pay, PhonePe, Paytm, or BHIM to auto-fill{' '}
+                      <strong className="text-light-on-surface">₹{amount.toLocaleString('en-IN')}</strong>.
+                    </p>
+
+                    <div className="p-2.5 rounded-lg bg-white border border-light-outline-variant/80 flex flex-col gap-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-label text-[11px] text-light-on-surface-variant">
+                          Merchant UPI ID
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setEditingMerchantUpi((prev) => !prev)}
+                          className="font-label text-[11px] text-light-primary hover:underline cursor-pointer"
+                        >
+                          {editingMerchantUpi ? 'Done' : 'Change UPI ID'}
+                        </button>
+                      </div>
+
+                      {editingMerchantUpi ? (
+                        <input
+                          type="text"
+                          value={merchantUpiInput}
+                          onChange={(e) => setMerchantUpiInput(e.target.value)}
+                          placeholder="yourname@okaxis"
+                          autoComplete="off"
+                          aria-label="Receiver Merchant UPI ID"
+                          className="w-full px-2.5 py-1.5 rounded border border-light-outline-variant bg-light-surface-container-lowest text-light-on-surface font-mono text-xs focus:border-light-primary focus:outline-none"
+                        />
+                      ) : (
+                        <div className="flex items-center justify-between gap-2">
+                          <code className="font-mono text-xs text-light-primary font-semibold truncate">
+                            {activeMerchantUpiId}
+                          </code>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard?.writeText(activeMerchantUpiId).catch(() => {});
+                              setCopiedUpi(true);
+                              window.setTimeout(() => setCopiedUpi(false), 1800);
+                            }}
+                            className="px-2 py-1 rounded bg-light-surface-container-low hover:bg-sage-surface text-light-on-surface font-label text-[11px] shrink-0 cursor-pointer transition-colors"
+                          >
+                            {copiedUpi ? 'Copied!' : 'Copy'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2 flex-wrap pt-0.5">
+                      <a
+                        href={upiQrPayload}
+                        className="inline-flex items-center gap-1.5 text-xs font-label text-light-primary hover:underline"
+                      >
+                        <span className="material-symbols-outlined text-[15px]" aria-hidden="true">
+                          open_in_new
+                        </span>
+                        Open UPI App
+                      </a>
+                      <span className="font-body text-[11px] text-light-on-surface-variant">
+                        Then click Confirm below
+                      </span>
+                    </div>
+                  </div>
                 </div>
-                <div className="flex flex-col gap-0.5 min-w-0">
-                  <span className="font-title text-sm font-semibold text-light-on-surface">
-                    Instant UPI Intent Ready
-                  </span>
-                  <span className="font-body text-xs text-light-on-surface-variant">
-                    Approve ₹{amount.toLocaleString('en-IN')} inside {upiApp} or click Pay Now to authorize immediately.
-                  </span>
-                </div>
-              </div>
+              ) : (
+                <>
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-label text-label-md text-light-on-surface">Preferred UPI App</span>
+                      {isSandboxOrTest && (
+                        <button
+                          type="button"
+                          onClick={fillTestDetails}
+                          className="font-label text-xs text-light-primary hover:underline cursor-pointer"
+                        >
+                          Use Test UPI ID
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {UPI_APPS.map((app) => (
+                        <button
+                          key={app}
+                          type="button"
+                          onClick={() => setUpiApp(app)}
+                          className={`px-3 py-2 rounded-lg border text-xs font-label transition-colors cursor-pointer ${
+                            upiApp === app
+                              ? 'bg-light-primary text-light-on-primary border-light-primary'
+                              : 'bg-light-surface-container-low border-light-outline-variant text-light-on-surface hover:border-light-primary/50'
+                          }`}
+                        >
+                          {app}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <label className="flex flex-col gap-1.5">
+                    <span className="font-label text-label-md text-light-on-surface">
+                      Enter your UPI ID / VPA
+                    </span>
+                    <input
+                      type="text"
+                      value={upiId}
+                      onChange={(e) => setUpiId(e.target.value)}
+                      placeholder="arjun@okaxis"
+                      autoComplete="off"
+                      className="w-full px-3.5 py-2.5 rounded-lg border border-light-outline-variant bg-white text-light-on-surface font-mono text-sm focus:border-light-primary focus:ring-2 focus:ring-light-primary/20 focus:outline-none"
+                    />
+                    <span className="font-body text-xs text-light-on-surface-variant">
+                      Zero convenience fee · Instant payment confirmation via NPCI UPI
+                    </span>
+                  </label>
+                </>
+              )}
             </div>
           )}
 
@@ -851,7 +1043,13 @@ export function PaymentGatewayModal({
                 {processing ? 'hourglass_top' : 'verified_user'}
               </span>
               <span>
-                {processing ? stageLabel : `Pay ₹${amount.toLocaleString('en-IN')} Securely`}
+                {processing
+                  ? stageLabel
+                  : method === 'upi' && upiMode === 'qr'
+                    ? `Confirm QR Payment · ₹${amount.toLocaleString('en-IN')}`
+                    : isRazorpayConfigured
+                      ? `Pay ₹${amount.toLocaleString('en-IN')} with Razorpay`
+                      : `Pay ₹${amount.toLocaleString('en-IN')} Securely`}
               </span>
             </button>
 

@@ -1136,6 +1136,10 @@ async function startServer() {
     total: number;
     userId?: string;
     paymentInfo?: OrderPaymentInfo;
+    sessionId?: string;
+    razorpayOrderId?: string;
+    razorpayPaymentId?: string;
+    razorpaySignature?: string;
   }): Promise<{ order: Order; stockOverrides: Record<string, number> }> {
     const orderNum = 1000 + Math.floor(Math.random() * 9000);
     const resolvedShipping: OrderShipping = params.paymentInfo
@@ -1170,8 +1174,22 @@ async function startServer() {
           updates[prod.id] = newStock;
         }
       }
-      await stockRepo.batchUpdateStockOverrides(updates);
-      await orderRepo.createOrder(order, params.userId);
+
+      if (params.sessionId && params.paymentInfo?.paymentStatus === 'Paid') {
+        await orderRepo.verifyAndCompletePaymentOrder({
+          sessionId: params.sessionId,
+          order,
+          userId: params.userId,
+          paymentInfo: params.paymentInfo,
+          razorpayOrderId: params.razorpayOrderId,
+          razorpayPaymentId: params.razorpayPaymentId,
+          razorpaySignature: params.razorpaySignature,
+          stockUpdates: updates,
+        });
+      } else {
+        await stockRepo.batchUpdateStockOverrides(updates);
+        await orderRepo.createOrder(order, params.userId);
+      }
 
       const kafkaUserId = params.userId ?? 'guest';
       publishOrderPlaced(order, kafkaUserId).catch((e) =>
@@ -1234,12 +1252,19 @@ async function startServer() {
   app.get('/api/payments/config', (_req: Request, res: Response) => {
     const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
     const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
+    const envMerchantUpi = (process.env.MERCHANT_UPI_ID || '').trim();
+    const merchantUpiId = /^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(envMerchantUpi)
+      ? envMerchantUpi
+      : 'findkart@icici';
+    const merchantName = (process.env.MERCHANT_UPI_NAME || 'FindKart').trim().slice(0, 48) || 'FindKart';
 
     const razorpayReady = Boolean(razorpayKeyId && razorpaySecret);
 
     const config: PaymentGatewayConfig = {
       mode: razorpayReady ? 'live-razorpay' : 'sandbox',
       razorpayKeyId: razorpayReady ? razorpayKeyId : undefined,
+      merchantUpiId,
+      merchantName,
       providers: {
         razorpay: razorpayReady,
         sandbox: true,
@@ -1363,6 +1388,18 @@ async function startServer() {
     };
     pendingPaymentSessions.set(sessionId, session);
 
+    if (isPgActive) {
+      await orderRepo.createPaymentRecord({
+        sessionId,
+        userId: claims?.uid,
+        provider,
+        razorpayOrderId,
+        paymentMethod,
+        amount: total,
+        amountPaise,
+      });
+    }
+
     const signature = signPaymentSession(sessionId, amountPaise, paymentMethod);
     res.status(201).json({
       sessionId,
@@ -1427,6 +1464,8 @@ async function startServer() {
 
     const rawProof = (body.paymentProof || {}) as Record<string, unknown>;
     let paymentInfo: OrderPaymentInfo;
+    let verifiedRazorpayPaymentId: string | undefined;
+    let verifiedRazorpaySignature: string | undefined;
 
     const razorpayKeyId = (process.env.RAZORPAY_KEY_ID || '').trim();
     const isRazorpayTestKey = razorpayKeyId.startsWith('rzp_test_');
@@ -1440,6 +1479,9 @@ async function startServer() {
       const razorpaySecret = (process.env.RAZORPAY_KEY_SECRET || '').trim();
 
       if (!razorpaySecret || !rpOrderId || !rpPaymentId || !rpSignature || rpOrderId !== session.razorpayOrderId) {
+        if (isPgActive) {
+          await orderRepo.markPaymentFailed(sessionId, 'Invalid Razorpay payment payload').catch(() => {});
+        }
         res.status(400).json({ message: 'Invalid Razorpay payment verification payload.' });
         return;
       }
@@ -1451,16 +1493,77 @@ async function startServer() {
       const rpBuf = Buffer.from(rpSignature);
       const genBuf = Buffer.from(generatedSig);
       if (rpBuf.length !== genBuf.length || !crypto.timingSafeEqual(rpBuf, genBuf)) {
+        if (isPgActive) {
+          await orderRepo.markPaymentFailed(sessionId, 'HMAC signature mismatch').catch(() => {});
+        }
         res.status(403).json({ message: 'Razorpay payment signature verification failed.' });
         return;
       }
 
+      // Defense-in-depth: confirm payment status & method via Razorpay Payments API when reachable
+      let methodLabel = 'Online Payment (Razorpay)';
+      let maskedDetail: string | undefined = session.razorpayOrderId;
+      if (razorpayKeyId && /^pay_[A-Za-z0-9]+$/.test(rpPaymentId)) {
+        try {
+          const auth = Buffer.from(`${razorpayKeyId}:${razorpaySecret}`).toString('base64');
+          const rpPayRes = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(rpPaymentId)}`, {
+            method: 'GET',
+            headers: { Authorization: `Basic ${auth}` },
+            signal: AbortSignal.timeout(4000),
+          });
+          if (rpPayRes.ok) {
+            const rpPay = (await rpPayRes.json()) as {
+              order_id?: string;
+              amount?: number;
+              currency?: string;
+              status?: string;
+              method?: string;
+              vpa?: string;
+              bank?: string;
+              wallet?: string;
+              card?: { last4?: string; network?: string };
+            };
+            if (
+              (rpPay.order_id && rpPay.order_id !== session.razorpayOrderId) ||
+              (typeof rpPay.amount === 'number' && rpPay.amount !== session.amountPaise) ||
+              (rpPay.currency && rpPay.currency !== 'INR') ||
+              (rpPay.status && !['authorized', 'captured'].includes(rpPay.status))
+            ) {
+              if (isPgActive) {
+                await orderRepo.markPaymentFailed(sessionId, `Unexpected Razorpay payment status: ${rpPay.status}`).catch(() => {});
+              }
+              res.status(402).json({ message: 'Razorpay payment was not authorized or captured.' });
+              return;
+            }
+            if (rpPay.method === 'upi') {
+              methodLabel = 'UPI (Razorpay)';
+              maskedDetail = rpPay.vpa ? `${rpPay.vpa} · ${session.razorpayOrderId}` : session.razorpayOrderId;
+            } else if (rpPay.method === 'card') {
+              methodLabel = `${rpPay.card?.network || 'Card'} (Razorpay)`;
+              maskedDetail = rpPay.card?.last4
+                ? `•••• ${rpPay.card.last4} · ${session.razorpayOrderId}`
+                : session.razorpayOrderId;
+            } else if (rpPay.method === 'netbanking') {
+              methodLabel = 'NetBanking (Razorpay)';
+              maskedDetail = rpPay.bank ? `${rpPay.bank} · ${session.razorpayOrderId}` : session.razorpayOrderId;
+            } else if (rpPay.method === 'wallet') {
+              methodLabel = 'Wallet (Razorpay)';
+              maskedDetail = rpPay.wallet ? `${rpPay.wallet} · ${session.razorpayOrderId}` : session.razorpayOrderId;
+            }
+          }
+        } catch {
+          // Cryptographic HMAC signature already succeeded cleanly
+        }
+      }
+
+      verifiedRazorpayPaymentId = rpPaymentId;
+      verifiedRazorpaySignature = rpSignature;
       paymentInfo = {
         gateway: 'Razorpay',
         transactionId: rpPaymentId,
         paymentStatus: 'Paid',
-        methodLabel: 'Online Payment (Razorpay)',
-        maskedDetail: session.razorpayOrderId,
+        methodLabel,
+        maskedDetail,
         paidAt: new Date().toISOString(),
       };
     } else {
@@ -1469,14 +1572,25 @@ async function startServer() {
       let maskedDetail: string | undefined;
 
       if (methodOverride === 'upi') {
-        const upiId = typeof rawProof.upiId === 'string' ? rawProof.upiId.trim() : '';
+        const upiMode = rawProof.upiMode === 'qr' ? 'qr' : 'vpa';
         const upiApp = typeof rawProof.upiApp === 'string' ? rawProof.upiApp.trim().slice(0, 32) : '';
-        if (!/^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(upiId)) {
-          res.status(400).json({ message: 'Enter a valid UPI ID (e.g., name@okaxis).' });
-          return;
+        if (upiMode === 'qr') {
+          const payeeUpiId = typeof rawProof.payeeUpiId === 'string' ? rawProof.payeeUpiId.trim() : '';
+          if (!/^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(payeeUpiId)) {
+            res.status(400).json({ message: 'Invalid merchant UPI ID for QR payment.' });
+            return;
+          }
+          methodLabel = upiApp ? `UPI QR (${upiApp})` : 'UPI QR Scan';
+          maskedDetail = `QR · ${payeeUpiId}`;
+        } else {
+          const upiId = typeof rawProof.upiId === 'string' ? rawProof.upiId.trim() : '';
+          if (!/^[\w.\-]{2,64}@[a-zA-Z0-9]{2,32}$/.test(upiId)) {
+            res.status(400).json({ message: 'Enter a valid UPI ID (e.g., name@okaxis).' });
+            return;
+          }
+          methodLabel = upiApp ? `UPI (${upiApp})` : 'UPI Instant Pay';
+          maskedDetail = upiId;
         }
-        methodLabel = upiApp ? `UPI (${upiApp})` : 'UPI Instant Pay';
-        maskedDetail = upiId;
       } else if (methodOverride === 'card') {
         const last4 = typeof rawProof.cardLast4 === 'string' ? rawProof.cardLast4.trim() : '';
         const cardBrand = typeof rawProof.cardBrand === 'string' ? rawProof.cardBrand.trim().slice(0, 24) : 'Card';
@@ -1505,9 +1619,10 @@ async function startServer() {
       }
 
       const txnSuffix = crypto.randomBytes(5).toString('hex').toUpperCase();
+      verifiedRazorpayPaymentId = session.provider === 'razorpay' ? `pay_test_${txnSuffix}` : undefined;
       paymentInfo = {
         gateway: session.provider === 'razorpay' ? 'Razorpay' : 'FindKart Sandbox',
-        transactionId: session.provider === 'razorpay' ? `pay_test_${txnSuffix}` : `FKPAY-${txnSuffix}`,
+        transactionId: verifiedRazorpayPaymentId || `FKPAY-${txnSuffix}`,
         paymentStatus: 'Paid',
         methodLabel,
         maskedDetail: session.razorpayOrderId ? `${maskedDetail || ''} · ${session.razorpayOrderId}` : maskedDetail,
@@ -1530,6 +1645,10 @@ async function startServer() {
       total: session.total,
       userId: claims?.uid || session.userId,
       paymentInfo,
+      sessionId: session.sessionId,
+      razorpayOrderId: session.razorpayOrderId,
+      razorpayPaymentId: verifiedRazorpayPaymentId,
+      razorpaySignature: verifiedRazorpaySignature,
     });
 
     pendingPaymentSessions.delete(sessionId);

@@ -103,6 +103,8 @@ export interface Order {
 export interface PaymentGatewayConfig {
   mode: 'live-razorpay' | 'sandbox';
   razorpayKeyId?: string;
+  merchantUpiId?: string;
+  merchantName?: string;
   providers: {
     razorpay: boolean;
     sandbox: boolean;

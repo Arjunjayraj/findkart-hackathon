@@ -111,7 +111,7 @@
     }
   ],
   "stockOverrides": {
-    "home-soundcore-anc": 2
+    "home-soundcore-anc": 1
   },
   "stockNotifications": []
 }
