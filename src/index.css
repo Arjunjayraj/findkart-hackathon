@@ -1,56 +1,58 @@
 @import "tailwindcss";
 
 @theme {
-  --color-accent-yellow: #F9BD00;
-  --color-on-accent-yellow: #251A00;
-  --color-success: #15803D;
+  --color-accent-yellow: #E2B340;
+  --color-on-accent-yellow: #17231C;
+  --color-sage-surface: #E7EDE2;
+  --color-terracotta: #D96B52;
+  --color-success: #1D6E48;
   --color-on-success: #FFFFFF;
-  --color-success-container: #DCFCE7;
-  --color-on-success-container: #14532D;
+  --color-success-container: #DCF2E6;
+  --color-on-success-container: #11452C;
   --color-warning: #B45309;
   --color-on-warning: #FFFFFF;
   --color-warning-container: #FEF3C7;
   --color-on-warning-container: #78350F;
-  --color-light-primary: #00389B;
+  --color-light-primary: #0E3426;
   --color-light-on-primary: #FFFFFF;
-  --color-light-primary-container: #164EC4;
+  --color-light-primary-container: #184A37;
   --color-light-on-primary-container: #FFFFFF;
-  --color-light-secondary: #785A00;
+  --color-light-secondary: #5D7052;
   --color-light-on-secondary: #FFFFFF;
-  --color-light-secondary-container: #F9BD00;
-  --color-light-on-secondary-container: #251A00;
-  --color-light-tertiary: #752600;
+  --color-light-secondary-container: #D3E0C2;
+  --color-light-on-secondary-container: #17231C;
+  --color-light-tertiary: #9B4432;
   --color-light-on-tertiary: #FFFFFF;
-  --color-light-tertiary-container: #9C3500;
+  --color-light-tertiary-container: #B95843;
   --color-light-on-tertiary-container: #FFFFFF;
   --color-light-error: #BA1A1A;
   --color-light-on-error: #FFFFFF;
   --color-light-error-container: #FFDAD6;
   --color-light-on-error-container: #93000A;
-  --color-light-background: #F3F3FD;
-  --color-light-on-background: #191B22;
-  --color-light-surface: #FAF8FF;
-  --color-light-surface-dim: #D9D9E3;
+  --color-light-background: #FAF8F4;
+  --color-light-on-background: #1A241E;
+  --color-light-surface: #FAF8F4;
+  --color-light-surface-dim: #DED7C8;
   --color-light-surface-bright: #FFFFFF;
   --color-light-surface-container-lowest: #FFFFFF;
-  --color-light-surface-container-low: #F3F3FD;
-  --color-light-surface-container: #EDEDF7;
-  --color-light-surface-container-high: #E8E7F2;
-  --color-light-surface-container-highest: #E2E2EC;
-  --color-light-on-surface: #191B22;
-  --color-light-surface-variant: #E0E1F2;
-  --color-light-on-surface-variant: #434654;
-  --color-light-outline: #747685;
-  --color-light-outline-variant: #C3C6D6;
-  --color-light-inverse-surface: #2E3038;
-  --color-light-inverse-on-surface: #F0F0FA;
-  --color-light-inverse-primary: #B4C5FF;
+  --color-light-surface-container-low: #F4F1EA;
+  --color-light-surface-container: #EDE8DE;
+  --color-light-surface-container-high: #E6E0D4;
+  --color-light-surface-container-highest: #DED7C8;
+  --color-light-on-surface: #1A241E;
+  --color-light-surface-variant: #EAE4D8;
+  --color-light-on-surface-variant: #556159;
+  --color-light-outline: #7C877F;
+  --color-light-outline-variant: #DFD8CA;
+  --color-light-inverse-surface: #0E3426;
+  --color-light-inverse-on-surface: #F4F1EA;
+  --color-light-inverse-primary: #D4E0D2;
 
-  --font-display: "Mulish", sans-serif;
-  --font-headline: "Mulish", sans-serif;
-  --font-title: "Radio Canada Big", sans-serif;
-  --font-body: "Radio Canada Big", sans-serif;
-  --font-label: "Radio Canada Big", sans-serif;
+  --font-display: "Playfair Display", Georgia, serif;
+  --font-headline: "Playfair Display", Georgia, serif;
+  --font-title: "Plus Jakarta Sans", sans-serif;
+  --font-body: "Plus Jakarta Sans", sans-serif;
+  --font-label: "Plus Jakarta Sans", sans-serif;
   --font-mono: "Spline Sans Mono", monospace;
 
   --spacing-gutter-xs: 4px;
@@ -61,11 +63,11 @@
   --spacing-section: 48px;
   --spacing-page-margin: 20px;
 
-  --radius-sm: 4px;
-  --radius-DEFAULT: 8px;
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  --radius-xl: 20px;
+  --radius-sm: 6px;
+  --radius-DEFAULT: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
 }
 
 @layer utilities {
