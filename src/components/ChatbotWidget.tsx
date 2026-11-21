@@ -363,7 +363,7 @@ export function ChatbotWidget({
             window.setTimeout(() => inputRef.current?.focus(), 120);
           }}
           aria-label="Open FindKart Stock Assistant chatbot"
-          className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-40 inline-flex items-center gap-2.5 px-3.5 sm:px-4 h-12 sm:h-12 rounded-md bg-light-primary text-light-on-primary hover:bg-light-primary-container shadow-xl border border-accent-yellow/40 transition-all duration-150 cursor-pointer"
+          className="fixed bottom-[41px] right-4 sm:bottom-[49px] sm:right-6 z-40 inline-flex items-center gap-2.5 px-3.5 sm:px-4 h-12 sm:h-12 rounded-md bg-light-primary text-light-on-primary hover:bg-light-primary-container shadow-xl border border-accent-yellow/40 transition-all duration-150 cursor-pointer"
         >
           <span className="relative flex items-center justify-center">
             <span className="material-symbols-outlined text-[22px] text-accent-yellow" aria-hidden="true">
@@ -389,7 +389,7 @@ export function ChatbotWidget({
           role="dialog"
           aria-modal="false"
           aria-label="FindKart Stock Assistant Chatbot"
-          className="fixed inset-x-2 bottom-2 top-16 sm:top-auto sm:left-auto sm:bottom-6 sm:right-6 z-40 w-auto sm:w-[400px] md:w-[430px] sm:h-[590px] sm:max-h-[82dvh] flex flex-col rounded-md bg-light-surface-container-lowest border border-light-outline-variant shadow-2xl overflow-hidden"
+          className="fixed inset-x-2 bottom-2 top-16 sm:top-auto sm:left-auto sm:bottom-[49px] sm:right-6 z-40 w-auto sm:w-[400px] md:w-[430px] sm:h-[590px] sm:max-h-[82dvh] flex flex-col rounded-md bg-light-surface-container-lowest border border-light-outline-variant shadow-2xl overflow-hidden"
         >
           {/* Chat Header */}
           <div className="bg-light-primary text-light-on-primary px-3.5 sm:px-4 py-3 flex items-center justify-between gap-2 shrink-0 border-b border-light-primary-container">
